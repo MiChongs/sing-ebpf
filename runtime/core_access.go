@@ -14,3 +14,7 @@ func rawTCBackend(backend *public.TCBackend) *core.TCBackend {
 func rawSharedPacketRewriteBackend(backend *public.SharedPacketRewriteBackend) *core.SharedPacketRewriteBackend {
 	return core.UnwrapSharedPacketRewriteBackend(backend)
 }
+
+// coreAttachTCXOrdered is a variable so tests can observe the priority each
+// TCX attach requests without a TCX kernel.
+var coreAttachTCXOrdered = core.AttachTCXOrdered

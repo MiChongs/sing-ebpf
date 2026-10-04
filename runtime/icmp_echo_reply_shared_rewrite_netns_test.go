@@ -66,7 +66,8 @@ func TestSharedRewriteClsactReplacementPreservesICMPEchoReplyFilter(t *testing.T
 		t.Fatalf("bring up veth: %v", err)
 	}
 
-	const priority = 2 // force clsact so filter identity, rather than TCX link identity, is exercised.
+	forceTCClsact(t) // exercise filter identity rather than TCX link identity
+	const priority = 2
 	current, err := attachSharedRewriteInterface(device, backend, priority)
 	if err != nil {
 		t.Fatalf("attach current shared rewrite programs: %v", err)
@@ -77,7 +78,7 @@ func TestSharedRewriteClsactReplacementPreservesICMPEchoReplyFilter(t *testing.T
 		device,
 		backend,
 		priority,
-		sharedRewriteAttachmentOptions{skipLock: true, temporary: true},
+		sharedRewriteAttachmentOptions{lock: current.lock.(*sharedTCInterfaceLock), generation: 1},
 	)
 	if err != nil {
 		t.Fatalf("stage replacement shared rewrite programs: %v", err)
@@ -106,7 +107,8 @@ func TestICMPEchoSharedRewriteAnswersARealClientPing(t *testing.T) {
 
 	self, peer := createTestVethPair(t, "sbrwicmpw0", "sbrwicmpw1")
 
-	const priority = 2 // force clsact; TCX is covered by attachSharedRewriteInterface's own existing coverage.
+	forceTCClsact(t) // TCX is covered by attachSharedRewriteInterface's own existing coverage.
+	const priority = 2
 	attachment, err := attachSharedRewriteInterface(self, backend, priority)
 	if err != nil {
 		t.Fatalf("attach the shared packet-rewrite interface: %v", err)
@@ -154,6 +156,7 @@ func TestICMPEchoSharedRewriteIgnoresNonICMPToForceInterceptTarget(t *testing.T)
 
 	self, peer := createTestVethPair(t, "sbrwudpw0", "sbrwudpw1")
 
+	forceTCClsact(t)
 	const priority = 2
 	attachment, err := attachSharedRewriteInterface(self, backend, priority)
 	if err != nil {

@@ -127,9 +127,11 @@ that hook, `BPF_LINK_CREATE` included. The backend never displaces such an
 owner: attachment fails with `ErrCgroupHookOccupied`, whose message names the
 programs on the hook. A foreign owner attached without any flag to the cgroup
 v2 root also blocks that hook in every descendant cgroup, so selecting another
-cgroup path does not help; the TC data plane is the alternative. At startup, with the cgroup locked,
-the backend reclaims its own stale programs and any `sb_proc_*` program left as
-the sole single-program owner of a hook by an earlier build.
+cgroup path does not help; the TC data plane is the alternative. At startup the
+backend reclaims stale interception programs (all of them when no other backend
+is alive on the cgroup, otherwise only those of its own instance slot) and any
+`sb_proc_*` program left as the sole single-program owner of a hook by an
+earlier build.
 
 `NewSelfBypass` creates no kernel object. Consumers build it while
 constructing their configuration, which also happens in unprivileged
@@ -183,10 +185,13 @@ local routes for the two halves of each address family. Two `/1` routes are used
 instead of one `/0` route because Android kernels can reject a default route of
 type `local`.
 
-Policy-routing setup holds a process-external lock, chooses unused mark/table/
-priority identifiers, and rejects unrelated routes or rules that already reference
-the selected table. Stale matching state from
-an interrupted instance is replaced during startup. Rules and routes are added
+Policy-routing setup holds a process-external instance slot, chooses unused
+mark/table/priority identifiers while it holds a short allocation mutex shared
+with every other runtime, and rejects unrelated routes or rules that already
+reference the selected table. Each slot prefers identifiers of its own, and a
+runtime replaces stale state found under exactly its slot's identifiers, which
+an interrupted holder of the slot left behind; slot 0's are those of
+single-instance builds. Rules and routes are added
 before the control map is enabled and removed only after interception is
 disabled and interface filters are detached.
 
@@ -206,6 +211,66 @@ include list is configured, CIDR and MAC are alternative selectors (OR); a
 matching CIDR or MAC exclude always wins. Local and shared destination-bypass
 CIDR maps are separate, so a consumer can update `local.bypass_rule_set` and
 `shared.bypass_rule_set` independently without aliasing policy state.
+
+## Multiple instances
+
+Several runtimes and backends, in one process or in several, can attach to the
+same interface, cgroup and network namespace: for example two inbounds that
+intercept different shared clients, or a local and a shared runtime on one
+interface. Each attachment holds an instance slot of its resource, up to 16 per
+interface, per cgroup and per network namespace for policy routing. A slot is an
+abstract unix socket the kernel releases with its owner, so holding one also
+proves that state left under its names is stale. Slot 0 keeps the lock names,
+filter names, handles, program names and preferred routing identifiers of
+single-instance builds.
+
+- **TC and TCX.** Each runtime's clsact filters carry its slot in their name and
+  handle (`sb_tc_shared`, `sb_tc_shared.1`, ...), so no runtime touches
+  another's. TCX is used at every TC priority: every sing-ebpf program on a TCX
+  hook carries its runtime's priority in a bound one-entry map
+  (`sb_tcx_prio`), and a runtime inserts itself before the first sing-ebpf
+  program with a larger priority, retrying when the hook revision changes. On
+  clsact the kernel orders filters by the same priority. Programs pass traffic
+  they do not select (`TC_ACT_UNSPEC`, which TCX treats as next), so a packet
+  is handled by the first runtime in hook order that selects it. The relative
+  order of runtimes with equal priorities is unspecified; give them distinct
+  priorities when it matters. Reading the order needs `CAP_SYS_ADMIN`; without
+  it a runtime attaches through clsact instead.
+- **Policy routing.** Every runtime owns its own mark bit, table and rule
+  priority, preferring those of its routing slot so that the next holder of the
+  slot can reclaim what an interrupted runtime left behind.
+- **Shared settings.** `conf.all.rp_filter` and an interface's `route_localnet`
+  are reference counted with leases: a runtime that leaves while another still
+  depends on the setting leaves it in place, and the last one restores the
+  original value. Interfaces pinned when the aggregate filter was lowered keep
+  the previous aggregate value if their pinning runtime leaves first, which is
+  the effective filter they had before.
+- **cgroup.** Backends sharing a cgroup hold a shared lock on it and run their
+  programs in attach order, descendants' before ancestors'. A later backend
+  never redirects a destination an earlier one already redirected: IPv4
+  redirect tokens lie in `127.0.0.0/8`, and IPv6 tokens carry the marker
+  `5eb6` at the start of their interface identifier, so a destination in
+  `fc00::/7` with that marker is never redirected by the cgroup path. Programs
+  of slot `n` > 0 carry a hexadecimal `_n` suffix (`sb_ebpf_conn4_3`). Slots
+  are per network namespace, so backends sharing a cgroup are expected to share
+  one; a backend that finds a lock holder of its cgroup in another namespace
+  reclaims no slot's leftovers. On a kernel that rejects multi-program
+  attachment the first backend attaches exclusively and the next reports
+  `ErrCgroupHookOccupied`.
+
+Each runtime or backend still needs its own listeners, listener ports and
+redirect prefixes, and a consumer must keep every runtime from intercepting
+another's outbound sockets: share one `SelfBypass` between the runtimes of one
+process, and use UID or process-cgroup policy across processes.
+
+Builds without multi-instance support hold slot 0 of an interface or of policy
+routing exclusively and an exclusive lock on a cgroup, so they never share
+kernel names with this build. They do not take part in shared-setting leases,
+however: do not run one beside this build with local TC or shared
+`packet_rewrite` in the same network namespace.
+
+`AttachmentInfo.Slot`, `TCNetworkInfo.RoutingSlot` and
+`CgroupBackend.InstanceSlot` report the slots a runtime holds.
 
 ## Object layout
 

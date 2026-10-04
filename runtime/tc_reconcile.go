@@ -296,13 +296,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, backend *common
 		return false, nil
 	}
 	if a.role.local {
-		attached, err := tcFilterAttached(
-			link,
-			netlink.HANDLE_MIN_EGRESS,
-			"sb_tc_local",
-			tcLocalFilterHandle,
-			priority,
-		)
+		attached, err := a.slotFilterAttached(link, tcFilterRoleLocal, priority)
 		if err != nil {
 			return false, E.Cause(err, "inspect TC local egress filter on interface ", a.interfaceName)
 		}
@@ -310,13 +304,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, backend *common
 			return false, nil
 		}
 		if icmpEchoReplyEnabled {
-			attached, err = tcFilterAttached(
-				link,
-				netlink.HANDLE_MIN_EGRESS,
-				"sb_icmp_local",
-				tcLocalICMPReplyFilterHandle,
-				priority,
-			)
+			attached, err = a.slotFilterAttached(link, tcFilterRoleLocalICMP, priority)
 			if err != nil {
 				return false, E.Cause(err, "inspect icmp_echo_reply local egress filter on interface ", a.interfaceName)
 			}
@@ -326,13 +314,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, backend *common
 		}
 	}
 	if a.role.shared {
-		attached, err := tcFilterAttached(
-			link,
-			netlink.HANDLE_MIN_INGRESS,
-			"sb_tc_shared",
-			tcSharedFilterHandle,
-			priority,
-		)
+		attached, err := a.slotFilterAttached(link, tcFilterRoleShared, priority)
 		if err != nil {
 			return false, E.Cause(err, "inspect TC shared ingress filter on interface ", a.interfaceName)
 		}
@@ -340,13 +322,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, backend *common
 			return false, nil
 		}
 		if icmpEchoReplyEnabled {
-			attached, err = tcFilterAttached(
-				link,
-				netlink.HANDLE_MIN_INGRESS,
-				"sb_icmp_shared",
-				tcSharedICMPReplyFilterHandle,
-				priority,
-			)
+			attached, err = a.slotFilterAttached(link, tcFilterRoleSharedICMP, priority)
 			if err != nil {
 				return false, E.Cause(err, "inspect icmp_echo_reply shared ingress filter on interface ", a.interfaceName)
 			}
@@ -401,26 +377,36 @@ func (a *tcInterfaceAttachment) clearStaleAttachments(priority uint16, backend *
 		return nil
 	}
 	if a.role.local {
-		if err = clearStaleTCFilter(link, netlink.HANDLE_MIN_EGRESS, "sb_tc_local", tcLocalFilterHandle, priority, &a.localFilter); err != nil {
+		if err = a.clearStaleSlotFilter(link, tcFilterRoleLocal, priority, &a.localFilter); err != nil {
 			return E.Cause(err, "inspect TC local egress filter on interface ", a.interfaceName)
 		}
 		if icmpEchoReplyEnabled {
-			if err = clearStaleTCFilter(link, netlink.HANDLE_MIN_EGRESS, "sb_icmp_local", tcLocalICMPReplyFilterHandle, priority, &a.localICMPFilter); err != nil {
+			if err = a.clearStaleSlotFilter(link, tcFilterRoleLocalICMP, priority, &a.localICMPFilter); err != nil {
 				return E.Cause(err, "inspect icmp_echo_reply local egress filter on interface ", a.interfaceName)
 			}
 		}
 	}
 	if a.role.shared {
-		if err = clearStaleTCFilter(link, netlink.HANDLE_MIN_INGRESS, "sb_tc_shared", tcSharedFilterHandle, priority, &a.sharedFilter); err != nil {
+		if err = a.clearStaleSlotFilter(link, tcFilterRoleShared, priority, &a.sharedFilter); err != nil {
 			return E.Cause(err, "inspect TC shared ingress filter on interface ", a.interfaceName)
 		}
 		if icmpEchoReplyEnabled {
-			if err = clearStaleTCFilter(link, netlink.HANDLE_MIN_INGRESS, "sb_icmp_shared", tcSharedICMPReplyFilterHandle, priority, &a.sharedICMPFilter); err != nil {
+			if err = a.clearStaleSlotFilter(link, tcFilterRoleSharedICMP, priority, &a.sharedICMPFilter); err != nil {
 				return E.Cause(err, "inspect icmp_echo_reply shared ingress filter on interface ", a.interfaceName)
 			}
 		}
 	}
 	return nil
+}
+
+func (a *tcInterfaceAttachment) slotFilterAttached(link netlink.Link, role tcFilterRole, priority uint16) (bool, error) {
+	identity := tcSlotFilter(a.slot, 0, role)
+	return tcFilterAttached(link, identity.parent, identity.name, identity.handle, priority)
+}
+
+func (a *tcInterfaceAttachment) clearStaleSlotFilter(link netlink.Link, role tcFilterRole, priority uint16, filter **netlink.BpfFilter) error {
+	identity := tcSlotFilter(a.slot, 0, role)
+	return clearStaleTCFilter(link, identity.parent, identity.name, identity.handle, priority, filter)
 }
 
 // clearStaleTCFilter clears *filter if it is non-nil but the kernel no
@@ -640,9 +626,8 @@ func (d *tcDeliveryLink) repair(backend *commonEBPF.TCBackend, priority uint16) 
 			changed = true
 		}
 	}
-	aggregateStates, err := clearTCAggregateRPFilter(d.deliveryName)
-	if len(aggregateStates) > 0 {
-		d.globalSysctls = appendTCSysctlStates(d.globalSysctls, aggregateStates)
+	aggregateChanged, err := d.claimAggregateRPFilter()
+	if aggregateChanged {
 		changed = true
 	}
 	if err != nil {
@@ -654,13 +639,14 @@ func (d *tcDeliveryLink) repair(backend *commonEBPF.TCBackend, priority uint16) 
 // closeStaleTCAttachmentsLocked releases the attachments that no longer describe
 // the interface they were created for, before the attach pass takes any lock.
 //
-// Being wanted by name is not enough to keep one. The interface lock is named
-// after the interface index alone, so an attachment holds the lock for the index
-// it was created at, and that index is only still its own while the interface
-// still carries it. An attachment whose interface was renumbered is holding a
-// lock for an index another interface may be given. Keeping such an attachment
-// until the end of the reconciliation makes the interface that took the index
-// fail to attach, whichever order the two are processed in.
+// Being wanted by name is not enough to keep one. The interface lock is a slot
+// of the interface index, so an attachment holds a slot of the index it was
+// created at, and that index is only still its own while the interface still
+// carries it. An attachment whose interface was renumbered is holding a slot of
+// an index another interface may be given. Keeping such an attachment until the
+// end of the reconciliation pushes the interface that took the index into
+// another slot, or makes it fail to attach once every slot is held, whichever
+// order the two are processed in.
 //
 // An attachment still sitting at its own index and framing is left alone: it may be healthy,
 // and deciding that is the attach pass's job.
@@ -709,7 +695,7 @@ func (d *tcDataPlane) closeStaleTCAttachmentsLocked(
 
 // canStageTCLocalReplacement reports whether attachment can keep intercepting
 // local traffic while a replacement is attached. The old attachment cannot be
-// retained when its index is needed by the replacement: interface locks are
+// retained when its index is needed by the replacement: interface slots are
 // keyed by index and the old interface has already ceased to be a usable
 // handover path in that case.
 func canStageTCLocalReplacement(attachment *tcInterfaceAttachment, desired map[string]tcAttachmentState) bool {

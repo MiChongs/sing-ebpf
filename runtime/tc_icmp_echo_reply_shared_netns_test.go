@@ -170,7 +170,8 @@ func TestICMPEchoSharedReplyAnswersARealClientPing(t *testing.T) {
 
 	self, peer := createTestVethPair(t, "sbicmpw0", "sbicmpw1")
 
-	const priority = 2 // force clsact; see TestICMPEchoLocalReplyAnswersARealPingViaTCX for the TCX case.
+	forceTCClsact(t) // see TestICMPEchoLocalReplyAnswersARealPingViaTCX for the TCX case.
+	const priority = 2
 	lock, err := acquireTCInterfaceLock("sbicmpw0", self.Attrs().Index)
 	if err != nil {
 		t.Fatalf("acquire the interface lock: %v", err)

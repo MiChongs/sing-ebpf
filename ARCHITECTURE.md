@@ -29,9 +29,10 @@ interpreting their own configuration and route rules.
 | shared socket assignment | programs/maps, assignments, source policy | downstream attachment, policy routing, reconciliation | listeners, shared-source metadata, TCP/UDP handling |
 | shared packet rewrite | rewrite programs/maps, flow lookup/update and counters | downstream attachment, `route_localnet`, health and rollback | token listeners, userspace flow lifecycle, policy translation, warning presentation |
 
-The consumer may combine one local and one shared choice. A path disabled by
-the consumer must not load its object, attach a hook, create a route, start a
-worker, or change a sysctl. No library package may interpret FakeIP mappings,
+The consumer may combine one local and one shared choice per runtime, and may
+run several runtimes on the same interfaces, cgroups and network namespace. A
+path disabled by the consumer must not load its object, attach a hook, create a
+route, start a worker, or change a sysctl. No library package may interpret FakeIP mappings,
 route-rule objects, package names, or a consumer's API schema.
 
 Force-intercept prefixes are deliberately generic. They allow a consumer to
@@ -138,6 +139,31 @@ remove only routes, rules, qdiscs, sysctls, links, and attachments it created or
 positively reclaimed as its own. It must never delete an unrelated object's
 state solely because a numeric handle matches.
 
+## Multi-instance coordination
+
+Several runtimes and backends may share an interface, a cgroup and a network
+namespace. Kernel state that has to be told apart between them is keyed by an
+instance slot (`internal/core/instance_slot.go`): clsact filter names and
+handles by an interface slot and a make-before-break generation, preferred
+policy-routing identifiers by a routing slot, and cgroup program names by a
+cgroup slot. A slot is an abstract unix socket bound for the owner's lifetime,
+and it stays held while any attachment, including one that could not detach,
+still has state under its names. Positively reclaiming state as one's own
+therefore means holding the slot whose names it carries; a cgroup backend that
+holds the cgroup lock exclusively, proving no other backend is alive, may
+reclaim every slot's. Slot names are scoped to a network namespace, so a cgroup
+backend that finds a lock holder of its cgroup in another namespace reclaims no
+slot's programs. Slot 0 keeps the names of single-instance builds, which locked
+it exclusively.
+
+Settings that several runtimes depend on at once, `conf.all.rp_filter` and
+`route_localnet`, are reference counted with enumerable leases that carry the
+value to restore; only the last holder restores it. Short critical sections
+that read and then claim shared state, such as policy-routing identifier
+selection and lease bookkeeping, take an instance mutex. TCX programs carry
+their runtime's priority in a bound marker map and are inserted in priority
+order with a revision-checked anchor.
+
 When `AttachProcessTracker` returns both a tracker and an error, cleanup could
 not detach every legacy cgroup hook. The caller owns that incomplete tracker
 and must retry `Close`; it must not use the tracker for process lookup.
@@ -172,8 +198,8 @@ make check
 
 Also run privileged network-namespace tests for TCX and clsact fallback,
 interface recreation, partial detach retry, delivery-veth repair, policy-route
-collision/rollback, shared `route_localnet` restore, and force-intercept ICMP
-Echo Reply paths.
+collision/rollback, shared `route_localnet` restore, multi-instance attachment,
+and force-intercept ICMP Echo Reply paths.
 Verify consumer builds with `with_ebpf` both enabled and disabled and generated
 objects for little- and big-endian targets. `boundary_test.go` must continue to
 reject every sing-box or sing-tun import anywhere in the source and test tree.

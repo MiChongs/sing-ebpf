@@ -142,9 +142,11 @@ cgroup. Optional components that share a cgroup with the interception backend,
 such as the process tracker on the cgroup v2 root, use
 `attachCgroupProgramShared`: a single-program hook would make the kernel reject
 the backend's own multi-program or link attachment on that hook. Startup
-reclaim may detach `sb_ebpf_*` programs, and `sb_proc_*` programs only when one
-is the sole program of a hook not in multi-program mode; keep the program name
-prefixes in `program_name.go` in sync with that rule.
+reclaim may detach the `sb_ebpf_*` programs of the backend's own cgroup slot, or
+of every slot while it holds the cgroup lock exclusively, and `sb_proc_*`
+programs only when one is the sole program of a hook not in multi-program mode;
+keep the program name prefixes in `program_name.go` and the slot suffixes of
+`cgroupKernelProgramName` in sync with that rule.
 
 On kernels without `BPF_MAP_LOOKUP_AND_DELETE_ELEM`, userspace must not emulate
 atomic consume with separate lookup and delete syscalls. It retains the bounded
@@ -175,6 +177,20 @@ Every resource must have one owner and appear in reverse-order cleanup. Verify:
 - workers are cancellable and joined; timers do not create idle wakeups without
   a concrete unobservable state to check; and
 - callbacks are never invoked while holding a lock they can re-enter.
+
+Several runtimes may share an interface, a cgroup and a network namespace (see
+the multi-instance section of [ARCHITECTURE.md](ARCHITECTURE.md)). For any new
+kernel state that another instance could also create, verify:
+
+- its name, handle or identifier is derived from a held instance slot, never a
+  fixed constant shared by every instance;
+- startup reclaims stale state only under the slot whose names it carries, and
+  a reclaim must not depend on a numeric handle alone;
+- a setting several runtimes depend on is restored by the last lease holder,
+  not by the runtime that happened to change it;
+- a read-then-claim sequence over shared state holds an instance mutex; and
+- programs keep passing unselected traffic (`TC_ACT_UNSPEC`, `TCX_NEXT`, or
+  `1` from a cgroup hook) so later instances on the same hook still see it.
 
 Shared runtime notifications are delivered after releasing the runtime lock.
 `PrepareBackend` is different: it is a synchronous factory inside the
@@ -241,7 +257,9 @@ sudo env \
 
 Set `SING_EBPF_REQUIRE_TCX=1` only on a host where TCX is expected and should be
 a hard requirement. The normal integration suite must also exercise `clsact`
-fallback instead of treating TCX as universally available.
+fallback instead of treating TCX as universally available. TCX serves every TC
+priority, so a test that needs the clsact path calls `forceTCClsact(t)` rather
+than choosing a non-default priority.
 
 The privileged matrix should cover all affected combinations:
 
@@ -250,6 +268,8 @@ The privileged matrix should cover all affected combinations:
 - Ethernet and supported raw-IP framing where applicable;
 - object-load and attach fallback selection;
 - interface absence, recreation, role change, and ifindex reuse;
+- several runtimes or backends on one interface, cgroup or namespace,
+  including priority order, stale-slot reclaim and shared-setting restore;
 - route/rule collision, partial startup, detach failure, and cleanup retry;
 - fragmented packet pass behavior and pass/failure counters;
 - UDP flow creation, reply restoration, timeout, release, queue pressure, and

@@ -166,27 +166,58 @@ func TestExclusiveCgroupAttachKeepsLegacyFallbackOnEmptyHook(t *testing.T) {
 }
 
 func TestReclaimableCgroupProgram(t *testing.T) {
+	const exclusive = cgroupReclaimAllSlots
 	for _, testCase := range []struct {
 		name     string
+		slot     int
 		flags    uint32
 		count    int
 		reclaim  bool
 		scenario string
 	}{
-		{kernelProgramNameCgroupConnect4, unix.BPF_F_ALLOW_MULTI, 2, true, "stale backend program in multi mode"},
-		{kernelProgramNameCgroupConnect4, 0, 1, true, "stale backend program in exclusive mode"},
-		{kernelProgramNameProcessConnect4, 0, 1, true, "stale exclusive tracker blocks the hook"},
-		{kernelProgramNameProcessConnect4, unix.BPF_F_ALLOW_OVERRIDE, 1, true, "stale override tracker blocks the hook"},
-		{kernelProgramNameProcessConnect4, unix.BPF_F_ALLOW_MULTI, 1, false, "live multi tracker of this or another process"},
-		{kernelProgramNameProcessRelease, unix.BPF_F_ALLOW_MULTI, 3, false, "multi tracker beside other owners"},
-		{kernelProgramNameSelfConnect4, 0, 1, false, "self-bypass belongs to a process cgroup"},
-		{"inet4_connect", 0, 1, false, "foreign owner"},
-		{"", 0, 1, false, "unnamed foreign owner"},
+		{kernelProgramNameCgroupConnect4, exclusive, unix.BPF_F_ALLOW_MULTI, 2, true, "stale backend program in multi mode"},
+		{kernelProgramNameCgroupConnect4, exclusive, 0, 1, true, "stale backend program in exclusive mode"},
+		{kernelProgramNameCgroupConnect4 + "_3", exclusive, unix.BPF_F_ALLOW_MULTI, 2, true, "stale program of another slot while no backend is alive"},
+		{kernelProgramNameCgroupConnect4, 0, unix.BPF_F_ALLOW_MULTI, 2, true, "stale program of the held slot 0"},
+		{kernelProgramNameCgroupRecvmsg6 + "_f", 15, unix.BPF_F_ALLOW_MULTI, 2, true, "stale program of the held slot 15"},
+		{kernelProgramNameCgroupConnect4 + "_3", 0, unix.BPF_F_ALLOW_MULTI, 2, false, "program of a live backend in slot 3"},
+		{kernelProgramNameCgroupConnect4, 3, unix.BPF_F_ALLOW_MULTI, 2, false, "program of a live backend in slot 0"},
+		{kernelProgramNameCgroupConnect4 + "_x", 3, unix.BPF_F_ALLOW_MULTI, 2, false, "unknown suffix"},
+		{kernelProgramNameCgroupConnect4, cgroupReclaimNoSlot, unix.BPF_F_ALLOW_MULTI, 2, false, "slot numbers not unique across network namespaces"},
+		{"sb_ebpf_unknown", cgroupReclaimNoSlot, unix.BPF_F_ALLOW_MULTI, 2, false, "unknown name, no slot reclaim"},
+		{kernelProgramNameProcessConnect4, cgroupReclaimNoSlot, 0, 1, true, "stale exclusive tracker still blocks the hook"},
+		{kernelProgramNameProcessConnect4, exclusive, 0, 1, true, "stale exclusive tracker blocks the hook"},
+		{kernelProgramNameProcessConnect4, 2, 0, 1, true, "stale exclusive tracker blocks the hook beside live backends"},
+		{kernelProgramNameProcessConnect4, exclusive, unix.BPF_F_ALLOW_OVERRIDE, 1, true, "stale override tracker blocks the hook"},
+		{kernelProgramNameProcessConnect4, exclusive, unix.BPF_F_ALLOW_MULTI, 1, false, "live multi tracker of this or another process"},
+		{kernelProgramNameProcessRelease, exclusive, unix.BPF_F_ALLOW_MULTI, 3, false, "multi tracker beside other owners"},
+		{kernelProgramNameSelfConnect4, exclusive, 0, 1, false, "self-bypass belongs to a process cgroup"},
+		{"inet4_connect", exclusive, 0, 1, false, "foreign owner"},
+		{"", exclusive, 0, 1, false, "unnamed foreign owner"},
 	} {
-		if got := reclaimableCgroupProgram(testCase.name, testCase.flags, testCase.count); got != testCase.reclaim {
-			t.Errorf("%s: reclaimable(%q, %#x, %d) = %v, want %v",
-				testCase.scenario, testCase.name, testCase.flags, testCase.count, got, testCase.reclaim)
+		if got := reclaimableCgroupProgram(testCase.name, testCase.slot, testCase.flags, testCase.count); got != testCase.reclaim {
+			t.Errorf("%s: reclaimable(%q, slot %d, %#x, %d) = %v, want %v",
+				testCase.scenario, testCase.name, testCase.slot, testCase.flags, testCase.count, got, testCase.reclaim)
 		}
+	}
+}
+
+// TestCgroupKernelProgramNamesIdentifyTheirSlot covers the names reclaim relies
+// on: every slot's name fits the kernel's limit and reads back as that slot.
+func TestCgroupKernelProgramNamesIdentifyTheirSlot(t *testing.T) {
+	for _, definition := range cgroupProgramDefinitions {
+		for slot := range MaxInstanceSlots {
+			name := cgroupKernelProgramName(definition.kernelProgramName, slot)
+			if len(name) > 15 {
+				t.Errorf("slot %d name %q exceeds the kernel's 15-byte limit", slot, name)
+			}
+			if got := cgroupProgramSlot(name); got != slot {
+				t.Errorf("cgroupProgramSlot(%q) = %d, want %d", name, got, slot)
+			}
+		}
+	}
+	if got := cgroupProgramSlot(kernelProgramNameProcessConnect4); got != -1 {
+		t.Errorf("a process tracker name reads as slot %d", got)
 	}
 }
 
@@ -209,5 +240,35 @@ func TestCgroupProgramNamePrefixes(t *testing.T) {
 		if strings.HasPrefix(name, kernelProgramPrefixCgroup) {
 			t.Errorf("process tracker program %q would be reclaimed as an interception program", name)
 		}
+	}
+}
+
+func TestForeignNetworkNamespaceLockHolder(t *testing.T) {
+	const listing = `1: FLOCK  ADVISORY  READ  100 00:1d:42 0 EOF
+1: -> FLOCK  ADVISORY  WRITE 300 00:1d:42 0 EOF
+2: FLOCK  ADVISORY  READ  200 00:1d:43 0 EOF
+3: POSIX  ADVISORY  WRITE 400 00:1d:42 0 EOF
+4: FLOCK  ADVISORY  READ  500 00:1d:42 0 EOF
+`
+	namespaces := map[int]string{100: "net:[1]", 200: "net:[2]", 300: "net:[1]", 400: "net:[2]"}
+	lookup := func(pid int) (string, error) {
+		namespace, found := namespaces[pid]
+		if !found {
+			return "", os.ErrNotExist
+		}
+		return namespace, nil
+	}
+	if foreignNetworkNamespaceLockHolder(strings.NewReader(listing), "00:1d:42", 1, "net:[1]", lookup) {
+		t.Fatal("holders in the own network namespace, a POSIX lock and an exited holder counted as foreign")
+	}
+	if !foreignNetworkNamespaceLockHolder(strings.NewReader(listing), "00:1d:43", 1, "net:[1]", lookup) {
+		t.Fatal("a holder in another network namespace was missed")
+	}
+	if foreignNetworkNamespaceLockHolder(strings.NewReader(listing), "00:1d:43", 200, "net:[1]", lookup) {
+		t.Fatal("the own process counted as a foreign holder")
+	}
+	denied := func(int) (string, error) { return "", unix.EACCES }
+	if !foreignNetworkNamespaceLockHolder(strings.NewReader(listing), "00:1d:42", 1, "net:[1]", denied) {
+		t.Fatal("a holder whose namespace cannot be read did not count as foreign")
 	}
 }

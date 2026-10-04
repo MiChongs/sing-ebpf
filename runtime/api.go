@@ -14,6 +14,9 @@ import (
 
 const (
 	// DefaultTCPriority is used when a runtime config leaves Priority unset.
+	// Priority orders the runtimes that share an interface hook: lower values
+	// run first, as clsact filter priorities and, through the ordered attach,
+	// TCX programs do. Runtimes with equal priorities have no defined order.
 	DefaultTCPriority uint16 = 1
 	defaultTCPriority        = DefaultTCPriority
 )
@@ -118,6 +121,7 @@ func (d *tcDataPlane) NetworkInfo() core.TCNetworkInfo {
 		info.RoutingMark = d.routing.mark
 		info.RoutingTable = d.routing.table
 		info.RoutingPriority = d.routing.priority
+		info.RoutingSlot = d.routing.slot
 	}
 	return info
 }
@@ -142,6 +146,7 @@ func (d *tcDataPlane) TCDiagnostics() core.TCDiagnostics {
 		info.RoutingMark = d.routing.mark
 		info.RoutingTable = d.routing.table
 		info.RoutingPriority = d.routing.priority
+		info.RoutingSlot = d.routing.slot
 	}
 	mode := ""
 	for _, attachment := range d.attachments {

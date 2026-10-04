@@ -26,7 +26,8 @@ func TestICMPEchoReplyHealthCheckDetectsAndRepairsAMissingClsactFilter(t *testin
 	const forceInterceptTarget = "198.18.0.1"
 	self := setupICMPEchoReplyPingVeth(t, "sbicmph0", "sbicmph1", forceInterceptTarget)
 
-	const priority = 2 // force clsact; see TestAttachTCInterfaceAddsTheICMPEchoReplyFilterWhenEnabled.
+	forceTCClsact(t) // see TestAttachTCInterfaceAddsTheICMPEchoReplyFilterWhenEnabled.
+	const priority = 2
 	lock, err := acquireTCInterfaceLock("sbicmph0", self.Attrs().Index)
 	if err != nil {
 		t.Fatalf("acquire the interface lock: %v", err)

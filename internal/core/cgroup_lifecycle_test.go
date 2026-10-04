@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -210,7 +211,10 @@ func TestLockCgroupFileReportsHeldLockNeutrally(t *testing.T) {
 	}
 	defer contender.Close()
 
-	err = lockCgroupFile(contender)
+	previousTimeout := cgroupSharedLockTimeout
+	cgroupSharedLockTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { cgroupSharedLockTimeout = previousTimeout })
+	_, err = lockCgroupFile(contender)
 	if err == nil {
 		t.Fatal("locking a cgroup that is already locked reported success")
 	}
@@ -220,8 +224,8 @@ func TestLockCgroupFileReportsHeldLockNeutrally(t *testing.T) {
 	message := err.Error()
 	for _, expected := range []string{
 		"the exclusive lock on this cgroup is already held",
-		"another active instance",
-		"an earlier close that did not finish",
+		"active instance of a sing-ebpf build without multi-instance support",
+		"an earlier close of one that did not finish",
 		"lock cgroup",
 	} {
 		if !strings.Contains(message, expected) {
@@ -241,11 +245,52 @@ func TestLockCgroupFileSucceedsOnFreeCgroup(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer file.Close()
-	if err = lockCgroupFile(file); err != nil {
+	exclusive, err := lockCgroupFile(file)
+	if err != nil {
 		t.Fatalf("locking a free cgroup failed: %v", err)
+	}
+	if !exclusive {
+		t.Fatal("the only backend on a cgroup was not told it holds it exclusively")
 	}
 	if lockable(t, directory) {
 		t.Fatal("the lock was not actually taken")
+	}
+}
+
+// TestLockCgroupFileSharesWithOtherBackends covers several backends on one
+// cgroup: a later backend shares the lock, is told it is not alone, and the
+// lock keeps excluding an exclusive holder while any backend remains.
+func TestLockCgroupFileSharesWithOtherBackends(t *testing.T) {
+	directory := t.TempDir()
+	open := func() *os.File {
+		file, err := os.Open(directory)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		t.Cleanup(func() { _ = file.Close() })
+		return file
+	}
+	first := open()
+	exclusive, err := lockCgroupFile(first)
+	if err != nil || !exclusive {
+		t.Fatalf("first backend: exclusive=%v err=%v", exclusive, err)
+	}
+	if err = shareCgroupLock(first); err != nil {
+		t.Fatalf("downgrade the first backend: %v", err)
+	}
+	second := open()
+	exclusive, err = lockCgroupFile(second)
+	if err != nil {
+		t.Fatalf("a second backend could not share the cgroup: %v", err)
+	}
+	if exclusive {
+		t.Fatal("a second backend was told it is alone on the cgroup")
+	}
+	if err = first.Close(); err != nil {
+		t.Fatalf("close the first backend: %v", err)
+	}
+	if lockable(t, directory) {
+		t.Fatal("an exclusive holder could take the cgroup while a backend remains")
 	}
 }
 
@@ -261,7 +306,7 @@ func TestLockCgroupFileKeepsOtherErrorsShaped(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	// Flocking a closed descriptor fails with EBADF rather than EWOULDBLOCK.
-	err = lockCgroupFile(file)
+	_, err = lockCgroupFile(file)
 	if err == nil {
 		t.Fatal("locking through a closed descriptor reported success")
 	}

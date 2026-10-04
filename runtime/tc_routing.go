@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
+	core "github.com/MiChongs/sing-ebpf/internal/core"
 	"github.com/sagernet/netlink"
 	"github.com/sagernet/netlink/nl"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -31,6 +32,7 @@ const (
 
 type tcPolicyRouting struct {
 	lock     io.Closer
+	slot     int
 	mark     uint32
 	table    int
 	priority int
@@ -45,19 +47,21 @@ type tcStalePolicyRouting struct {
 }
 
 func startTCPolicyRouting(enableIPv6 bool) (*tcPolicyRouting, error) {
-	// Keep the historical identifier so extracted and in-tree versions cannot
-	// concurrently allocate overlapping policy-routing resources while upgrading.
-	lock, err := net.ListenUnixgram("unixgram", &net.UnixAddr{
-		Name: "@sing-ebpf-tc-routing",
-		Net:  "unixgram",
+	// Every TC runtime in the network namespace owns its own mark, table and
+	// rule priority, and prefers those of its slot. Slot 0 keeps the historical
+	// lock name, which extracted, in-tree and single-instance versions hold
+	// exclusively, so only one of them or a slot-0 runtime of this build may
+	// reclaim the identifiers they share.
+	lock, err := core.AcquireInstanceSlot(func(slot int) string {
+		return core.InstanceSlotName("@sing-ebpf-tc-routing", slot)
 	})
 	if err != nil {
-		if errors.Is(err, unix.EADDRINUSE) {
-			return nil, E.New("TC eBPF policy routing is already managed by another sing-ebpf runtime")
+		if errors.Is(err, core.ErrInstanceSlotsExhausted) {
+			return nil, E.New("TC eBPF policy routing is already managed by ", core.MaxInstanceSlots, " sing-ebpf runtimes")
 		}
 		return nil, E.Cause(err, "lock TC eBPF policy routing")
 	}
-	routing := &tcPolicyRouting{lock: lock}
+	routing := &tcPolicyRouting{lock: lock, slot: lock.Index()}
 	cleanup := func(startErr error) (*tcPolicyRouting, error) {
 		closeErr := routing.Close()
 		if !routing.IsClosed() {
@@ -74,7 +78,15 @@ func startTCPolicyRouting(enableIPv6 bool) (*tcPolicyRouting, error) {
 		families = append(families, unix.AF_INET6)
 	}
 	routing.families = families
-	identifiers, err := allocateTCPolicyIdentifiers(loopback.Attrs().Index, families)
+	// Selection reads the live policy database, and what it picks is claimed
+	// only once the routes and rules below exist. Another runtime must not
+	// select in between.
+	allocation, err := core.AcquireInstanceMutex("tc-routing", core.DefaultInstanceMutexTimeout)
+	if err != nil {
+		return cleanup(err)
+	}
+	defer allocation.Close()
+	identifiers, err := allocateTCPolicyIdentifiers(loopback.Attrs().Index, families, routing.slot)
 	if err != nil {
 		return cleanup(err)
 	}
@@ -286,7 +298,30 @@ type tcPolicyIdentifiers struct {
 	priority int
 }
 
-func allocateTCPolicyIdentifiers(loopbackIndex int, families []int) (tcPolicyIdentifiers, error) {
+// tcPreferredPolicyIdentifiers are the identifiers a runtime holding routing
+// slot slot uses whenever they are free. Slot 0's are those of single-instance
+// builds, which held that slot exclusively.
+func tcPreferredPolicyIdentifiers(slot int) tcPolicyIdentifiers {
+	return tcPolicyIdentifiers{
+		mark:     commonEBPF.DefaultTCRoutingMark >> slot,
+		table:    tcPolicyRoutingTable + slot,
+		priority: tcPolicyRoutingPriority + slot,
+	}
+}
+
+// tcDynamicPolicyTableMin keeps every other selection out of the tables the
+// slots prefer, so no runtime holds another slot's preferred identifiers.
+const tcDynamicPolicyTableMin = tcPolicyRoutingTable + core.MaxInstanceSlots
+
+// allocateTCPolicyIdentifiers selects identifiers no live policy state uses for
+// the runtime holding routing slot slot.
+//
+// It prefers the slot's own identifiers. State found under exactly those is
+// what an interrupted holder of the slot left behind, since the caller holds
+// the slot now, and is reused; that includes the state single-instance builds
+// leave for slot 0. Only when the slot's identifiers are taken by something
+// else are free ones chosen, from outside the tables any slot prefers.
+func allocateTCPolicyIdentifiers(loopbackIndex int, families []int, slot int) (tcPolicyIdentifiers, error) {
 	usedTables := make(map[int]bool)
 	usedPriorities := make(map[int]bool)
 	var usedMarkBits uint32
@@ -332,43 +367,13 @@ func allocateTCPolicyIdentifiers(loopbackIndex int, families []int) (tcPolicyIde
 			usedMarkBits |= tcPolicyRuleMarkBits(rule)
 		}
 	}
-	preferred := tcPolicyIdentifiers{
-		mark:     commonEBPF.DefaultTCRoutingMark,
-		table:    tcPolicyRoutingTable,
-		priority: tcPolicyRoutingPriority,
+	preferred := tcPreferredPolicyIdentifiers(slot)
+	reclaim, err := preferredTCPolicyStateFound(loopbackIndex, families, preferred)
+	if err != nil {
+		return tcPolicyIdentifiers{}, err
 	}
-	managed := true
-	managedStateFound := false
-	for _, family := range families {
-		routes, err := netlink.RouteListFiltered(family, &netlink.Route{Table: preferred.table}, netlink.RT_FILTER_TABLE)
-		if err != nil {
-			return tcPolicyIdentifiers{}, E.Cause(err, "inspect TC eBPF policy state")
-		}
-		expectedRoutes := tcPolicyRoutesForTable(loopbackIndex, family, preferred.table)
-		for _, route := range routes {
-			if !matchesTCPolicyRoute(route, expectedRoutes) {
-				managed = false
-				break
-			}
-			managedStateFound = true
-		}
-		entries, err := listTCPolicyRules(family, *tcPolicyRuleFor(family, preferred.mark, preferred.table, preferred.priority))
-		if err != nil {
-			return tcPolicyIdentifiers{}, E.Cause(err, "inspect TC eBPF policy state")
-		}
-		for _, rule := range entries {
-			if rule.table != preferred.table {
-				continue
-			}
-			if rule.owned {
-				managedStateFound = true
-				break
-			}
-			managed = false
-			break
-		}
-	}
-	if managed && managedStateFound {
+	if reclaim || !usedTables[preferred.table] && !usedPriorities[preferred.priority] &&
+		usedMarkBits&preferred.mark == 0 {
 		return preferred, nil
 	}
 	identifiers := tcPolicyIdentifiers{}
@@ -379,7 +384,7 @@ func allocateTCPolicyIdentifiers(loopbackIndex int, families []int) (tcPolicyIde
 			strconv.FormatUint(uint64(usedMarkBits), 16), ")",
 		)
 	}
-	for table := tcPolicyRoutingTable; table <= tcPolicyTableMax; table++ {
+	for table := tcDynamicPolicyTableMin; table <= tcPolicyTableMax; table++ {
 		if !usedTables[table] {
 			identifiers.table = table
 			break
@@ -396,24 +401,62 @@ func allocateTCPolicyIdentifiers(loopbackIndex int, families []int) (tcPolicyIde
 	if identifiers.table == 0 {
 		return tcPolicyIdentifiers{}, E.New("no unused TC eBPF routing table is available")
 	}
-	for priority := tcPolicyRoutingPriority; priority <= tcPolicyPriorityMax; priority++ {
-		if !usedPriorities[priority] {
-			identifiers.priority = priority
-			break
-		}
-	}
-	if identifiers.priority == 0 {
-		for priority := tcPolicyPriorityMin; priority < tcPolicyRoutingPriority; priority++ {
-			if !usedPriorities[priority] {
-				identifiers.priority = priority
-				break
-			}
-		}
-	}
+	identifiers.priority = firstUnusedTCPolicyPriority(usedPriorities)
 	if identifiers.priority == 0 {
 		return tcPolicyIdentifiers{}, E.New("no unused TC eBPF policy priority is available")
 	}
 	return identifiers, nil
+}
+
+func firstUnusedTCPolicyPriority(used map[int]bool) int {
+	for priority := tcPolicyRoutingPriority; priority <= tcPolicyPriorityMax; priority++ {
+		if !used[priority] {
+			return priority
+		}
+	}
+	for priority := tcPolicyPriorityMin; priority < tcPolicyRoutingPriority; priority++ {
+		if !used[priority] {
+			return priority
+		}
+	}
+	return 0
+}
+
+// preferredTCPolicyStateFound reports whether the preferred identifiers carry
+// policy state exactly in the shape this package installs, and nothing else.
+func preferredTCPolicyStateFound(loopbackIndex int, families []int, preferred tcPolicyIdentifiers) (bool, error) {
+	managed := true
+	managedStateFound := false
+	for _, family := range families {
+		routes, err := netlink.RouteListFiltered(family, &netlink.Route{Table: preferred.table}, netlink.RT_FILTER_TABLE)
+		if err != nil {
+			return false, E.Cause(err, "inspect TC eBPF policy state")
+		}
+		expectedRoutes := tcPolicyRoutesForTable(loopbackIndex, family, preferred.table)
+		for _, route := range routes {
+			if !matchesTCPolicyRoute(route, expectedRoutes) {
+				managed = false
+				break
+			}
+			managedStateFound = true
+		}
+		entries, err := listTCPolicyRules(family, *tcPolicyRuleFor(family, preferred.mark, preferred.table, preferred.priority))
+		if err != nil {
+			return false, E.Cause(err, "inspect TC eBPF policy state")
+		}
+		for _, rule := range entries {
+			if rule.table != preferred.table {
+				continue
+			}
+			if rule.owned {
+				managedStateFound = true
+				break
+			}
+			managed = false
+			break
+		}
+	}
+	return managed && managedStateFound, nil
 }
 
 func selectTCPolicyMark(usedMarkBits uint32) uint32 {

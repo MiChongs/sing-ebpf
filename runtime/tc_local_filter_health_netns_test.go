@@ -29,7 +29,8 @@ func TestTCLocalFilterHealthCheckDetectsAndRepairsExternalDeletion(t *testing.T)
 		t.Fatalf("bring up veth: %v", err)
 	}
 
-	const priority = 2 // force clsact
+	forceTCClsact(t)
+	const priority = 2
 	lock, err := acquireTCInterfaceLock("sbtclocalh0", self.Attrs().Index)
 	if err != nil {
 		t.Fatalf("acquire the interface lock: %v", err)

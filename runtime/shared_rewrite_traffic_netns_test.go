@@ -32,17 +32,23 @@ var (
 // the shared packet-rewrite programs in both directions. With transmit
 // checksum offload disabled on both veth ends, each receiving kernel verifies
 // the rewritten checksums in software; with offload enabled the rewrite runs
-// on CHECKSUM_PARTIAL packets instead.
+// on CHECKSUM_PARTIAL packets instead. Both attachment mechanisms are covered.
 func TestSharedPacketRewriteCarriesTraffic(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string
 		offload bool
+		clsact  bool
 	}{
-		{name: "software_checksums", offload: false},
-		{name: "checksum_offload", offload: true},
+		{name: "tcx/software_checksums", offload: false},
+		{name: "tcx/checksum_offload", offload: true},
+		{name: "clsact/software_checksums", offload: false, clsact: true},
+		{name: "clsact/checksum_offload", offload: true, clsact: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			enterTestNetworkNamespace(t)
+			if testCase.clsact {
+				forceTCClsact(t)
+			}
 			setLoopbackUp(t)
 			backend := newSharedRewriteTrafficBackend(t)
 
@@ -85,7 +91,7 @@ func TestSharedPacketRewriteCarriesTraffic(t *testing.T) {
 			if _, err := enableSharedRewriteLocalnet("sbsrw0"); err != nil {
 				t.Fatal(err)
 			}
-			attachment := attachSharedRewriteOrSkip(t, router, backend, 2)
+			attachment := attachSharedRewriteOrSkip(t, router, backend, defaultTCPriority)
 			t.Cleanup(func() { _ = attachment.Close() })
 			if err := backend.Enable(); err != nil {
 				t.Fatalf("enable the backend: %v", err)

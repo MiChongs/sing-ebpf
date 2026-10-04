@@ -268,7 +268,7 @@ func assertICMPEchoReply(
 // TestICMPEchoLocalReplyAnswersARealPing's IPv6 counterpart, completing
 // the local role's coverage: IPv4 clsact, IPv4 TCX, and IPv6 TCX already
 // existed; this is IPv6 clsact, forced the same way the IPv4 clsact test
-// forces it (priority=2), so it cannot silently exercise TCX instead.
+// forces it (forceTCClsact), so it cannot silently exercise TCX instead.
 func TestICMPEchoLocalReplyAnswersARealIPv6PingViaClsact(t *testing.T) {
 	enterTestNetworkNamespace(t)
 	backend := newRealICMPEchoReplyBackendWithIPv6(t)
@@ -277,7 +277,8 @@ func TestICMPEchoLocalReplyAnswersARealIPv6PingViaClsact(t *testing.T) {
 	const forceInterceptTarget = "fc00::1"
 	self := setupICMPEchoReplyPingVethIPv6(t, "sbicmp60", "sbicmp61", forceInterceptTarget)
 
-	const priority = 2 // force clsact; TestICMPEchoLocalReplyAnswersARealIPv6PingViaTCX covers TCX.
+	forceTCClsact(t) // TestICMPEchoLocalReplyAnswersARealIPv6PingViaTCX covers TCX.
+	const priority = 2
 	attachment := attachICMPEchoReplyOrSkip(t, backend, "sbicmp60", self.Attrs().Index, tcInterfaceRole{local: true}, priority)
 	t.Cleanup(func() { _ = attachment.Close() })
 	if attachment.attachmentType != "clsact" {
@@ -300,7 +301,7 @@ func TestICMPEchoSharedReplyMatrix(t *testing.T) {
 		forceInterceptSharedReplyCase
 	}{
 		{"socket_assign/IPv6/clsact", forceInterceptSharedReplyCase{
-			dataPlane: forceInterceptSharedSocketAssign, ipv6: true, priority: 2,
+			dataPlane: forceInterceptSharedSocketAssign, ipv6: true, clsact: true, priority: 2,
 			selfName: "sbicmp6w0", peerName: "sbicmp6w1", client: "fd00:250::5", identifier: 0x6321, sequence: 4,
 		}},
 		{"socket_assign/IPv4/TCX", forceInterceptSharedReplyCase{
@@ -308,11 +309,12 @@ func TestICMPEchoSharedReplyMatrix(t *testing.T) {
 			selfName: "sbicmpxw0", peerName: "sbicmpxw1", client: "10.250.0.8", identifier: 0x7654, sequence: 5,
 		}},
 		{"socket_assign/IPv6/TCX", forceInterceptSharedReplyCase{
-			dataPlane: forceInterceptSharedSocketAssign, ipv6: true, priority: 1,
+			// A non-default priority keeps TCX since attachments are ordered.
+			dataPlane: forceInterceptSharedSocketAssign, ipv6: true, priority: 3,
 			selfName: "sbicmp6x0", peerName: "sbicmp6x1", client: "fd00:250::6", identifier: 0x8765, sequence: 6,
 		}},
 		{"packet_rewrite/IPv6/clsact", forceInterceptSharedReplyCase{
-			dataPlane: forceInterceptSharedPacketRewrite, ipv6: true, priority: 2,
+			dataPlane: forceInterceptSharedPacketRewrite, ipv6: true, clsact: true, priority: 2,
 			selfName: "sbrw6w0", peerName: "sbrw6w1", client: "fd00:250::7", identifier: 0x9876, sequence: 8,
 		}},
 		{"packet_rewrite/IPv4/TCX", forceInterceptSharedReplyCase{
