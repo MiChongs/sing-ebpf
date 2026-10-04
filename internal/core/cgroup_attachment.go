@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"unsafe"
 
 	E "github.com/sagernet/sing/common/exceptions"
 
@@ -34,16 +35,54 @@ func cgroupProgramLinkCloseComplete(programLink cgroupProgramLink, closeErr erro
 	return !retryable || retryableLink.IsClosed()
 }
 
+// attachRawLink is replaced in tests to exercise the legacy fallbacks without
+// a kernel that rejects BPF_LINK_CREATE.
+var attachRawLink = link.AttachRawLink
+
+// cgroupAttachPolicy selects whether a legacy cgroup attachment may end in
+// the kernel's single-program mode.
+type cgroupAttachPolicy uint8
+
+const (
+	// cgroupAttachAllowExclusive permits the unflagged legacy fallback on an
+	// empty hook when the kernel rejects multi-program attachment. Use it only
+	// for a component that owns its cgroup or has no other fallback.
+	cgroupAttachAllowExclusive cgroupAttachPolicy = iota
+	// cgroupAttachMultiOnly never leaves the hook in single-program mode. A
+	// single-program hook makes the kernel reject every later multi-program
+	// attachment, including BPF_LINK_CREATE, so an optional component that
+	// shares a cgroup with the interception backend must not create one.
+	cgroupAttachMultiOnly
+)
+
 // attachCgroupProgram prefers BPF_LINK_CREATE, whose cgroup implementation is
 // inherently multi-program, then falls back to legacy BPF_PROG_ATTACH. The
 // legacy path tries BPF_F_ALLOW_MULTI first and retries without flags only when
-// the kernel rejects multi attachment with a compatibility error.
+// the kernel rejects multi attachment with a compatibility error and the hook
+// is empty.
 func attachCgroupProgram(path string, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (cgroupProgramLink, error) {
+	return attachCgroupProgramWithPolicy(path, program, attachType, cgroupAttachAllowExclusive)
+}
+
+// attachCgroupProgramShared attaches an optional program to a cgroup that may
+// also carry the interception backend. It uses only multi-program operations,
+// so a kernel that rejects them makes the optional feature unavailable instead
+// of locking the required backend out of the same hook.
+func attachCgroupProgramShared(path string, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (cgroupProgramLink, error) {
+	return attachCgroupProgramWithPolicy(path, program, attachType, cgroupAttachMultiOnly)
+}
+
+func attachCgroupProgramWithPolicy(
+	path string,
+	program *CiliumEBPF.Program,
+	attachType CiliumEBPF.AttachType,
+	policy cgroupAttachPolicy,
+) (cgroupProgramLink, error) {
 	cgroupFile, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	programLink, linkErr := link.AttachRawLink(link.RawLinkOptions{
+	programLink, linkErr := attachRawLink(link.RawLinkOptions{
 		Target:  int(cgroupFile.Fd()),
 		Program: program,
 		Attach:  attachType,
@@ -56,7 +95,12 @@ func attachCgroupProgram(path string, program *CiliumEBPF.Program, attachType Ci
 		_ = cgroupFile.Close()
 		return nil, linkErr
 	}
-	if err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType); err != nil {
+	if policy == cgroupAttachMultiOnly {
+		err = attachProgramRawMultiOnly(int(cgroupFile.Fd()), program, attachType)
+	} else {
+		err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType)
+	}
+	if err != nil {
 		_ = cgroupFile.Close()
 		return nil, E.Errors(linkErr, err)
 	}
@@ -120,6 +164,54 @@ func lockCgroupFile(cgroupFile *os.File) error {
 	return eBPFOperationError("lock cgroup", err)
 }
 
+// queryCgroupHookFlags returns the attach mode the kernel recorded for a
+// cgroup hook (0, BPF_F_ALLOW_OVERRIDE or BPF_F_ALLOW_MULTI). cilium/ebpf's
+// QueryPrograms does not expose this field, so the request is issued directly;
+// with prog_cnt = 0 every kernel since BPF_PROG_QUERY was introduced returns
+// only the count and the flags.
+var queryCgroupHookFlags = func(cgroupFD int, attachType CiliumEBPF.AttachType) (uint32, error) {
+	// Leading fields of the BPF_PROG_QUERY member of union bpf_attr.
+	attr := struct {
+		targetFD    uint32
+		attachType  uint32
+		queryFlags  uint32
+		attachFlags uint32
+		programIDs  uint64
+		programs    uint32
+		_           uint32
+	}{
+		targetFD:   uint32(cgroupFD),
+		attachType: uint32(attachType),
+	}
+	_, _, errno := unix.Syscall(unix.SYS_BPF, unix.BPF_PROG_QUERY, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	if errno != 0 {
+		return 0, errno
+	}
+	return attr.attachFlags, nil
+}
+
+// reclaimableCgroupProgram decides which programs found on the interception
+// cgroup at startup are stale sing-ebpf state that may be detached. It runs
+// with the cgroup lock held, so no other interception backend is active here.
+//
+// Interception backend programs are always ours to reclaim.
+//
+// A process tracker program is reclaimed only when it is the single program of
+// a hook that is not in multi-program mode. The tracker attaches with
+// multi-program operations only, and BPF links are always multi-program, so
+// such an attachment can only come from an unflagged legacy BPF_PROG_ATTACH
+// made by an earlier sing-ebpf build. That attachment belongs to the cgroup,
+// survives its process, and makes the kernel reject every multi-program
+// attachment on the hook. A tracker attached by a live process in multi mode,
+// including one this process started before the backend, is left alone.
+func reclaimableCgroupProgram(name string, hookFlags uint32, programCount int) bool {
+	if strings.HasPrefix(name, kernelProgramPrefixCgroup) {
+		return true
+	}
+	return strings.HasPrefix(name, kernelProgramPrefixProcessTracker) &&
+		hookFlags&unix.BPF_F_ALLOW_MULTI == 0 && programCount == 1
+}
+
 func detachOwnedCgroupPrograms(cgroupFD int) error {
 	for _, definition := range cgroupProgramDefinitions {
 		first, err := queryCgroupProgramIDs(cgroupFD, definition.attachType)
@@ -128,6 +220,15 @@ func detachOwnedCgroupPrograms(cgroupFD int) error {
 				continue
 			}
 			return err
+		}
+		if len(first) == 0 {
+			continue
+		}
+		// Unknown flags are treated as multi-program mode so that only
+		// interception backend programs are reclaimed.
+		hookFlags := uint32(unix.BPF_F_ALLOW_MULTI)
+		if flags, flagsErr := queryCgroupHookFlags(cgroupFD, definition.attachType); flagsErr == nil {
+			hookFlags = flags
 		}
 		second, err := queryCgroupProgramIDs(cgroupFD, definition.attachType)
 		if err != nil {
@@ -146,7 +247,7 @@ func detachOwnedCgroupPrograms(cgroupFD int) error {
 				_ = program.Close()
 				return infoErr
 			}
-			if strings.HasPrefix(info.Name, "sb_ebpf_") {
+			if reclaimableCgroupProgram(info.Name, hookFlags, len(first)) {
 				if detachErr := rawDetachProgram(cgroupFD, program, definition.attachType); detachErr != nil {
 					_ = program.Close()
 					return detachErr
@@ -196,7 +297,7 @@ func (b *CgroupBackend) Attach() error {
 		if program == nil {
 			continue
 		}
-		programLink, err := link.AttachRawLink(link.RawLinkOptions{
+		programLink, err := attachRawLink(link.RawLinkOptions{
 			Target:  cgroupFD,
 			Program: program,
 			Attach:  cgroupProgramDefinitions[slot].attachType,

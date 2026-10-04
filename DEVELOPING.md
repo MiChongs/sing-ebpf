@@ -134,7 +134,15 @@ as well as the effective UDP cleanup, socket-storage, and time-source modes.
 The socket-release capability probe is deliberately multi-only: it must never
 fall back to an unflagged attach that could replace an existing cgroup owner.
 The ordinary cgroup hook attach may still use the legacy-exclusive fallback
-after querying for an existing owner.
+after querying for an existing owner, but only for the interception backend
+(which has no other fallback) and the self-bypass hooks in an exclusive process
+cgroup. Optional components that share a cgroup with the interception backend,
+such as the process tracker on the cgroup v2 root, use
+`attachCgroupProgramShared`: a single-program hook would make the kernel reject
+the backend's own multi-program or link attachment on that hook. Startup
+reclaim may detach `sb_ebpf_*` programs, and `sb_proc_*` programs only when one
+is the sole program of a hook not in multi-program mode; keep the program name
+prefixes in `program_name.go` in sync with that rule.
 
 On kernels without `BPF_MAP_LOOKUP_AND_DELETE_ELEM`, userspace must not emulate
 atomic consume with separate lookup and delete syscalls. It retains the bounded

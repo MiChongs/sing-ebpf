@@ -127,7 +127,12 @@ func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) 
 			return rollbackProcessTracker(tracker, loadErr)
 		}
 		tracker.programs = append(tracker.programs, program)
-		programLink, attachErr := attachCgroupProgram(cgroupPath, program, hook.attachType)
+		// The tracker always uses the cgroup v2 root, which is also the
+		// default interception cgroup. It must never leave a root hook in
+		// single-program mode: that would make the kernel reject the
+		// interception backend's own attachment, and the backend, unlike the
+		// tracker, has no userspace fallback.
+		programLink, attachErr := attachCgroupProgramShared(cgroupPath, program, hook.attachType)
 		if attachErr != nil {
 			return rollbackProcessTracker(tracker, E.Cause(attachErr, "attach eBPF process tracker ", hook.hookName, " hook"))
 		}
@@ -180,7 +185,7 @@ func (t *ProcessTracker) attachReleaseCleanup(cgroupPath string) {
 	if err != nil {
 		return
 	}
-	programLink, err := attachCgroupProgram(cgroupPath, program, CiliumEBPF.AttachCgroupInetSockRelease)
+	programLink, err := attachCgroupProgramShared(cgroupPath, program, CiliumEBPF.AttachCgroupInetSockRelease)
 	if err != nil {
 		_ = program.Close()
 		return
