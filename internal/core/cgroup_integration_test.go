@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
 	"golang.org/x/sys/unix"
 )
 
@@ -70,6 +71,7 @@ func TestCgroupProgramMatrixIntegration(t *testing.T) {
 			}
 			if test.udp {
 				assertCgroupUDPMapHandoff(t, backend)
+				assertCgroupUDPReleaseObserverLoaded(t, backend)
 			}
 		})
 	}
@@ -364,6 +366,20 @@ func createIntegrationCgroup(t *testing.T, root string, index int) (string, bool
 	}
 	t.Cleanup(func() { _ = os.Remove(path) })
 	return path, true
+}
+
+// assertCgroupUDPReleaseObserverLoaded catches a release-notification program
+// that the verifier rejects: the loader then falls back to deadline cleanup
+// without returning an error.
+func assertCgroupUDPReleaseObserverLoaded(t *testing.T, backend *CgroupBackend) {
+	t.Helper()
+	if !backend.runtime.socket_release_supported || features.HaveMapType(CiliumEBPF.RingBuf) != nil {
+		return
+	}
+	if mode := backend.UDPUserspaceCleanupMode(); mode != cgroupUDPUserspaceCleanupRingBuffer {
+		t.Fatalf("UDP userspace cleanup mode = %q, want %q: the socket-release notification program did not load",
+			mode, cgroupUDPUserspaceCleanupRingBuffer)
+	}
 }
 
 func prepareCgroupIntegrationBackend(path string, enableTCP, enableUDP, enableIPv6 bool) (*CgroupBackend, error) {

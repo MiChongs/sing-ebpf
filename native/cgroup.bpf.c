@@ -852,9 +852,14 @@ INLINE int release_socket_notify(struct bpf_sock *ctx) {
         // Notification is best-effort. A full ring only postpones userspace
         // cleanup until the ordinary UDP deadline.
         if (listener != 0) {
+            // One checked lookup: verifiers through at least Linux 6.12 treat
+            // every array lookup as nullable, so a second unchecked control()
+            // call is rejected and the loader silently falls back to deadline
+            // cleanup.
+            const struct sb_ebpf_cgroup_control *config = control();
             struct sb_ebpf_udp_release_event event = {
                 .socket_cookie = cookie,
-                .network_generation = control() != 0 ? control()->network_generation : 0U,
+                .network_generation = config != 0 ? config->network_generation : 0U,
                 .released_at_ns = released_at_ns,
             };
             __builtin_memcpy(&event.listener, listener, sizeof(event.listener));
