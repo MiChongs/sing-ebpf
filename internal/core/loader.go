@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"slices"
 
-	BPFGen "github.com/CHIZI-0618/sing-ebpf/internal/bpfgen"
+	BPFGen "github.com/MiChongs/sing-ebpf/internal/bpfgen"
 	E "github.com/sagernet/sing/common/exceptions"
 
 	CiliumEBPF "github.com/cilium/ebpf"

@@ -1,4 +1,4 @@
-module github.com/CHIZI-0618/sing-ebpf
+module github.com/MiChongs/sing-ebpf
 
 go 1.25.5
 

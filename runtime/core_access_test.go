@@ -5,7 +5,7 @@ package runtime
 import (
 	"testing"
 
-	public "github.com/CHIZI-0618/sing-ebpf"
+	public "github.com/MiChongs/sing-ebpf"
 )
 
 func TestEmptyTCFacadeRawProgramsAreUnavailable(t *testing.T) {

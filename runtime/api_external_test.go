@@ -5,7 +5,7 @@ package runtime_test
 import (
 	"testing"
 
-	kernelRuntime "github.com/CHIZI-0618/sing-ebpf/runtime"
+	kernelRuntime "github.com/MiChongs/sing-ebpf/runtime"
 )
 
 func TestPublicTCConstructorRejectsMissingBackend(t *testing.T) {

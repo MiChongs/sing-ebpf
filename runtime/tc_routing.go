@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strconv"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/netlink"
 	"github.com/sagernet/netlink/nl"
 	E "github.com/sagernet/sing/common/exceptions"

@@ -7,7 +7,7 @@ package runtime
 import (
 	"net/netip"
 
-	core "github.com/CHIZI-0618/sing-ebpf"
+	core "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/netlink"
 	E "github.com/sagernet/sing/common/exceptions"
 )

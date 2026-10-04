@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/sagernet/netlink"
 )

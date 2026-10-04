@@ -5,7 +5,7 @@ package runtime
 import (
 	"testing"
 
-	core "github.com/CHIZI-0618/sing-ebpf"
+	core "github.com/MiChongs/sing-ebpf"
 )
 
 func newLoopbackTestTCBackend(t *testing.T) *core.TCBackend {

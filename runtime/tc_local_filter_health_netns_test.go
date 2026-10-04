@@ -5,7 +5,7 @@ package runtime
 import (
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/netlink"
 )
 

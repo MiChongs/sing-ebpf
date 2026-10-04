@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	core "github.com/CHIZI-0618/sing-ebpf/internal/core"
+	core "github.com/MiChongs/sing-ebpf/internal/core"
 )
 
 type (

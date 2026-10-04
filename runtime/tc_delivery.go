@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/netlink"
 	E "github.com/sagernet/sing/common/exceptions"
 	"golang.org/x/sys/unix"
