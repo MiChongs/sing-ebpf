@@ -114,6 +114,8 @@ struct sb_shared_bypass_flow_value {
 
 struct sb_shared_scratch {
     struct sb_shared_original_key original;
+    // Occupies the alignment padding before token; see ingress_ipv6.
+    __u32 transport_offset;
     struct sb_shared_token_value token;
     struct sb_shared_listener_key listener_key;
     struct sb_shared_original_value original_value;
@@ -126,6 +128,7 @@ _Static_assert(sizeof(struct sb_shared_original_key) == 44U, "shared original ke
 _Static_assert(sizeof(struct sb_shared_listener_key) == 40U, "shared listener key ABI");
 _Static_assert(sizeof(struct sb_shared_original_value) == 40U, "shared original value ABI");
 _Static_assert(sizeof(struct sb_shared_token_value) == 40U, "shared token value ABI");
+_Static_assert(__builtin_offsetof(struct sb_shared_scratch, token) == 48U, "shared token offset ABI");
 _Static_assert(__builtin_offsetof(struct sb_shared_scratch, original_value) == 128U, "shared original value offset ABI");
 _Static_assert(sizeof(struct sb_shared_scratch) == SB_SHARED_NETWORK_SCRATCH_SIZE, "shared-network scratch ABI");
 
