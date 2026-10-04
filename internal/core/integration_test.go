@@ -4,11 +4,14 @@ package core
 
 import (
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"os"
 	"testing"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,6 +28,22 @@ func requireEBPFIntegration(t testing.TB, action string) {
 	}
 	if os.Geteuid() != 0 {
 		t.Fatal("eBPF integration test requires root")
+	}
+}
+
+// requireTCSocketAssignment skips tests of the TC socket-assignment object on
+// kernels without its socket helpers (Linux 5.7 and later have them). The
+// probe does not load the object, so a verifier regression still fails.
+func requireTCSocketAssignment(t testing.TB) {
+	t.Helper()
+	for _, helper := range []asm.BuiltinFunc{asm.FnSkcLookupTcp, asm.FnSkAssign} {
+		err := features.HaveProgramHelper(CiliumEBPF.SchedCLS, helper)
+		if errors.Is(err, CiliumEBPF.ErrNotSupported) {
+			t.Skipf("kernel lacks %s for TC socket assignment", helper)
+		}
+		if err != nil {
+			t.Fatalf("probe %s: %v", helper, err)
+		}
 	}
 }
 

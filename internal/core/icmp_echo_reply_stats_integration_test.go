@@ -11,6 +11,7 @@ import (
 // unsupported echo request from unrelated traffic to the same ForceIntercept.
 func TestICMPEchoReplyStatsCountsPassThroughNotOrdinaryTraffic(t *testing.T) {
 	requireEBPFIntegration(t, "verify icmp_echo_reply_stats counts pass-through correctly")
+	requireTCSocketAssignment(t)
 	policy := newTestForceInterceptPolicy(t, "198.18.0.0/15", "")
 	backend, err := PrepareTC(TCConfig{
 		ListenerPort:  65530,

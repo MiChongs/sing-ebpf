@@ -58,6 +58,10 @@ func openFDCount(t *testing.T) int {
 // and populateCompiledPolicyMaps, the two remaining backend.Close() call
 // sites in prepareTC, can no longer be driven to fail through TCConfig alone
 // either, for the same reason.
+// closedFDMaps holds maps whose descriptors a test closed directly, so their
+// finalizers never close a reused descriptor number.
+var closedFDMaps []*CiliumEBPF.Map
+
 func TestPrepareTCClosesRealMapsWhenAnExternalSelfMapDoesNotMatch(t *testing.T) {
 	before := openFDCount(t)
 
@@ -81,6 +85,9 @@ func TestPrepareTCClosesRealMapsWhenAnExternalSelfMapDoesNotMatch(t *testing.T) 
 	if closeErr := unix.Close(rawFD); closeErr != nil {
 		t.Fatalf("close the map's raw file descriptor: %v", closeErr)
 	}
+	// The map still records rawFD, and its finalizer would close that number
+	// again after another test's map may have reused it. Keep it reachable.
+	closedFDMaps = append(closedFDMaps, mismatched)
 
 	policy, err := CompileActionPolicy(ActionPolicy{
 		EnableTCP: true,

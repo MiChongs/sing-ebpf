@@ -31,8 +31,6 @@ INLINE int rewrite_ipv4(
 	__u32 checksum_offset = l4_offset + (protocol == IPPROTO_TCP_VALUE
 		? __builtin_offsetof(struct tcp_header_min, checksum)
 		: __builtin_offsetof(struct udp_header_min, checksum));
-	__s64 address_diff = csum_diff(&old_address, 4U, &new_address, 4U, 0U);
-	if (address_diff < 0) { record_rewrite_failure(); return TC_ACT_SHOT; }
 	if (l3_csum_replace(
 			skb,
             l3_offset + __builtin_offsetof(struct ipv4_header, checksum),
@@ -42,7 +40,9 @@ INLINE int rewrite_ipv4(
 		record_rewrite_failure();
 		return TC_ACT_SHOT;
 	}
-	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U)) != 0 ||
+	// A 4-byte pseudo-header replacement folds the address change directly;
+	// unlike IPv6 it needs no separate csum_diff call.
+	if (l4_csum_replace(skb, checksum_offset, old_address, new_address, pseudo_header_checksum_flags(protocol, 4U)) != 0 ||
 		l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U)) != 0 ||
         skb_store_bytes(skb, address_offset, &new_address, sizeof(new_address), 0U) != 0 ||
         skb_store_bytes(skb, port_offset, &new_port, sizeof(new_port), 0U) != 0) {

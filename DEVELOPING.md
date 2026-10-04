@@ -124,7 +124,9 @@ the map can itself fault affected kernels, so the safety deny-list and positive
 BTF evidence are kept separate from ordinary capability selection.
 
 Current important fallbacks include TCX → owned `clsact`, SOCKMAP-capable TCP →
-legacy TCP lookup, cgroup socket-release notification → bounded LRU cleanup,
+legacy TCP lookup, an MPTCP TCP listener (the Go default since Go 1.24, which a
+SOCKMAP rejects) → listener lookup by port, which needs a wildcard bind,
+cgroup socket-release notification → bounded LRU cleanup,
 socket-release probe permission denial → the same bounded LRU cleanup, and
 cgroup multi-program → compatible legacy exclusive attachment. Do not turn
 an optional fallback failure into a silent feature claim; diagnostics must name
@@ -187,7 +189,8 @@ is evicted at the bound instead of accumulating unbounded state.
 
 `runtime.TCRuntime.TCDiagnostics` is a request-driven, value-only snapshot of
 the effective TC socket-assignment runtime. It reports the actual TCX/clsact
-attachment mode (including `mixed`), SOCKMAP versus direct listener lookup,
+attachment mode (including `mixed`), SOCKMAP versus direct listener lookup
+(`mixed` when one listener family is found by port),
 delivery interface and policy-routing values, active and retired resource
 counts, priority, and whether the backend requires a rebuild. It does not
 expose maps, programs, links, file descriptors, or netlink objects.
@@ -269,7 +272,12 @@ alone is not an attachment or traffic test.
 ## Debugging evidence
 
 For verifier failures, retain the complete verifier log and identify the exact
-object/program variant. For runtime failures, collect:
+object/program variant. Before Linux 5.2 the verifier rejects a log buffer over
+16 MiB with EINVAL and an empty log, so cilium/ebpf's growing log retry can
+hide the real error, typically E2BIG from the 131072-instruction complexity
+limit; the loader then repeats the load without a log to report it. Changes to
+the shared packet-rewrite ingress program should be loaded on a 4.19 kernel,
+which has the least verifier headroom. For runtime failures, collect:
 
 - active attachment descriptions and effective mechanisms;
 - first error and timestamp, recovery state, and retry deadline;

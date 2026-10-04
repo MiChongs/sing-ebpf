@@ -4,20 +4,39 @@
 #ifndef SING_EBPF_SHARED_NETWORK_FLOW_H
 #define SING_EBPF_SHARED_NETWORK_FLOW_H
 
-NOINLINE __u32 hash_original(const struct sb_shared_original_key *key, __u32 salt) {
-    const __u8 *bytes = (const __u8 *)key;
-    __u32 hash = 2166136261U ^ salt;
+// Scratch and control fields copied or hashed below are 4-byte aligned, so
+// they can be accessed as words instead of byte by byte.
+#define SB_ALIGNED4(pointer) __builtin_assume_aligned((pointer), 4)
+
+INLINE __u32 mix32(__u32 value) {
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    return value ^ (value >> 16U);
+}
+
+// hash_original returns two independently seeded hashes of the flow key, one
+// per 32-bit half, from a single word-wise pass. Tokens only need to spread
+// across the prefix: the no-exist inserts resolve collisions.
+NOINLINE __u64 hash_original(const struct sb_shared_original_key *key, __u32 salt) {
+    __u32 first = 2166136261U ^ salt;
+    __u32 second = 0x85ebca6bU ^ salt;
 #pragma clang loop unroll(full)
-    for (__u32 index = 0U; index < sizeof(*key); ++index) {
-        hash ^= bytes[index];
-        hash *= 16777619U;
+    for (__u32 offset = 0U; offset < sizeof(*key); offset += sizeof(__u32)) {
+        __u32 word;
+        __builtin_memcpy(&word, (const __u8 *)SB_ALIGNED4(key) + offset, sizeof(word));
+        first = (first ^ word) * 16777619U;
+        first ^= first >> 15U;
+        second = (second ^ word) * 0x9e3779b1U;
+        second ^= second >> 13U;
     }
-    hash ^= hash >> 16U;
-    hash *= 0x7feb352dU;
-    hash ^= hash >> 15U;
-    hash *= 0x846ca68bU;
-    hash ^= hash >> 16U;
-    return hash;
+    return ((__u64)mix32(first) << 32U) | mix32(second);
+}
+
+INLINE void copy_scratch_address(__u8 destination[16], const __u8 source[16], bool ipv6) {
+    __builtin_memcpy(SB_ALIGNED4(destination), SB_ALIGNED4(source), 4U);
+    if (ipv6) __builtin_memcpy(SB_ALIGNED4(destination + 4U), SB_ALIGNED4(source + 4U), 12U);
 }
 
 INLINE void fill_listener(struct sb_shared_scratch *scratch, const struct sb_shared_control *control) {
@@ -26,14 +45,9 @@ INLINE void fill_listener(struct sb_shared_scratch *scratch, const struct sb_sha
     scratch->listener_key.protocol = scratch->original.protocol;
     scratch->listener_key.listener_port = control->listener_port;
     scratch->listener_key.client_port = scratch->original.client_port;
-    copy_address(
-        scratch->listener_key.token_addr,
-        scratch->token.token_addr,
-        scratch->original.family == AF_INET6_VALUE ? 16U : 4U);
-    copy_address(
-        scratch->listener_key.client_addr,
-        scratch->original.client_addr,
-        scratch->original.family == AF_INET6_VALUE ? 16U : 4U);
+    bool ipv6 = scratch->original.family == AF_INET6_VALUE;
+    copy_scratch_address(scratch->listener_key.token_addr, scratch->token.token_addr, ipv6);
+    copy_scratch_address(scratch->listener_key.client_addr, scratch->original.client_addr, ipv6);
     __builtin_memset(&scratch->original_value, 0, sizeof(scratch->original_value));
     scratch->original_value.family = scratch->original.family;
     scratch->original_value.protocol = scratch->original.protocol;
@@ -41,10 +55,7 @@ INLINE void fill_listener(struct sb_shared_scratch *scratch, const struct sb_sha
     scratch->original_value.ifindex = scratch->original.ifindex;
     scratch->original_value.generation = scratch->token.generation;
     __builtin_memcpy(scratch->original_value.source_mac, scratch->source_mac.address, 6U);
-    copy_address(
-        scratch->original_value.addr,
-        scratch->original.original_addr,
-        scratch->original.family == AF_INET6_VALUE ? 16U : 4U);
+    copy_scratch_address(scratch->original_value.addr, scratch->original.original_addr, ipv6);
 }
 
 NOINLINE bool publish_token(
@@ -72,17 +83,14 @@ INLINE void delete_token_generation(struct sb_shared_scratch *scratch) {
 #define SB_SHARED_TOKEN_RESERVED 1
 
 // Keep each attempt in its own BPF subprogram: LLVM 21 otherwise carries loop
-// state in caller-clobbered registers across the hash and map subprogram calls.
+// state in caller-clobbered registers across the map subprogram calls.
 NOINLINE int reserve_token_attempt(
     struct sb_shared_scratch *scratch,
     const struct sb_shared_control *control,
-    __u32 attempt) {
+    __u32 hash,
+    __u32 second,
+    __u64 now) {
     __builtin_memset(&scratch->token, 0, sizeof(scratch->token));
-    __u64 now = ktime_get_ns();
-    __u32 generation_salt = (__u32)now ^ (__u32)(now >> 32U);
-    __u32 hash = hash_original(
-        &scratch->original,
-        generation_salt ^ (0x9e3779b9U * (attempt + 1U)));
     if (scratch->original.family == AF_INET_VALUE) {
         __u32 prefix = ((__u32)control->token_ipv4_prefix[0] << 24U) |
             ((__u32)control->token_ipv4_prefix[1] << 16U) |
@@ -99,10 +107,7 @@ NOINLINE int reserve_token_attempt(
         scratch->token.token_addr[2] = (__u8)(candidate >> 8U);
         scratch->token.token_addr[3] = (__u8)candidate;
     } else {
-        copy_address(scratch->token.token_addr, control->token_ipv6_prefix, 8U);
-        __u32 second = hash_original(
-            &scratch->original,
-            generation_salt ^ 0x85ebca6bU ^ attempt);
+        __builtin_memcpy(SB_ALIGNED4(scratch->token.token_addr), SB_ALIGNED4(control->token_ipv6_prefix), 8U);
         scratch->token.token_addr[8] = (__u8)(hash >> 24U);
         scratch->token.token_addr[9] = (__u8)(hash >> 16U);
         scratch->token.token_addr[10] = (__u8)(hash >> 8U);
@@ -135,14 +140,27 @@ NOINLINE int reserve_token_attempt(
     return SB_SHARED_TOKEN_RETRY;
 }
 
+// The flow is hashed once per reservation and each attempt derives its own
+// candidate. Hashing inside every attempt multiplied the verifier's work by
+// the attempt count and put the ingress program over the Linux 4.19
+// complexity limit.
 NOINLINE bool reserve_token(
     struct sb_shared_scratch *scratch,
     const struct sb_shared_control *control) {
+    __u64 now = ktime_get_ns();
+    __u64 hashes = hash_original(&scratch->original, (__u32)now ^ (__u32)(now >> 32U));
+    __u32 hash = (__u32)(hashes >> 32U);
+    __u32 second = (__u32)hashes;
     int result = SB_SHARED_TOKEN_RETRY;
 #pragma clang loop unroll(full)
     for (__u32 attempt = 0U; attempt < SB_SHARED_TOKEN_ATTEMPTS; ++attempt) {
         if (result == SB_SHARED_TOKEN_RETRY) {
-            result = reserve_token_attempt(scratch, control, attempt);
+            result = reserve_token_attempt(
+                scratch,
+                control,
+                mix32(hash + 0x9e3779b9U * (attempt + 1U)),
+                mix32(second + 0x7f4a7c15U * (attempt + 1U)),
+                now);
         }
     }
     if (result != SB_SHARED_TOKEN_RESERVED) record_token_reservation_failure();

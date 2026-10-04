@@ -7,11 +7,13 @@ import "testing"
 func TestSelectedObjectLoadProbeIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "load the selected eBPF objects without attaching them")
 	tests := []struct {
-		name string
-		load func() (string, error)
+		name     string
+		tcSocket bool
+		load     func() (string, error)
 	}{
 		{
-			name: "tc",
+			name:     "tc",
+			tcSocket: true,
 			load: func() (string, error) {
 				return loadTCProbeObject(kernelProbePlan{
 					localTC: true, sharedSocketAssign: true,
@@ -46,6 +48,9 @@ func TestSelectedObjectLoadProbeIntegration(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if test.tcSocket {
+				requireTCSocketAssignment(t)
+			}
 			if _, err := test.load(); err != nil {
 				t.Fatal(err)
 			}

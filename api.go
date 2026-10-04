@@ -283,6 +283,9 @@ func wrapTCBackend(backend *core.TCBackend) *TCBackend {
 	return &TCBackend{TCBackendHandle: core.NewTCBackendHandle(backend)}
 }
 
+// RegisterTCPListener registers the transparent TCP listener. An MPTCP
+// listener, the Go default since Go 1.24, cannot be placed in a SOCKMAP; it is
+// then found by port and must be bound to the wildcard address.
 func (b *TCBackend) RegisterTCPListener(ipv6 bool, fd int) error {
 	return core.UnwrapTCBackend(b).RegisterTCPListener(ipv6, fd)
 }

@@ -16,6 +16,7 @@ import (
 // subset and must return TC_ACT_UNSPEC without changing a byte.
 func TestICMPEchoReplyPassThroughIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "verify icmp_echo_reply native pass-through behavior")
+	requireTCSocketAssignment(t)
 	policy := newTestForceInterceptPolicy(t, "198.18.0.0/15", "fc00::/18")
 	backend, err := PrepareTC(TCConfig{
 		ListenerPort:    65531,
