@@ -81,6 +81,14 @@ INLINE const struct sb_ebpf_cgroup_control *control(void) {
     __u32 key = 0U;
     return map_lookup(&cgroup_control, &key);
 }
+
+// A hash delete takes the bucket lock even when the key is absent, while a
+// lookup does not. Hooks that run for every socket use this for entries that
+// most sockets never have.
+INLINE void delete_present(void *map, const void *key) {
+    if (map_lookup(map, key) != 0) map_delete(map, key);
+}
+
 INLINE bool is_cookie_bypassed(__u64 cookie) {
     if (cookie == 0U) return false;
     __u32 *metadata = map_lookup(&cgroup_socket_bypass, &cookie);
@@ -144,12 +152,6 @@ INLINE bool host_ipv6(const __u32 address[4]) {
     struct sb_ebpf_ipv6_cidr_lpm_key key = {.prefixlen = 128U};
     __builtin_memcpy(key.addr, address, sizeof(key.addr));
     return map_lookup(&cgroup_host_ipv6, &key) != 0;
-}
-
-INLINE bool base_bypass(__u64 cookie, const struct sb_ebpf_cgroup_control *config, __u8 protocol) {
-    if (!protocol_selected(config, protocol)) return true;
-	if (is_cookie_bypassed(cookie)) return true;
-    return false;
 }
 
 INLINE void original_v4(
@@ -397,9 +399,9 @@ INLINE void reset_connected_udp(__u64 cookie) {
         __builtin_memcpy(&listener, current, sizeof(listener));
         map_delete(&cgroup_udp_redirect, &listener);
         map_delete(&cgroup_udp_token_reverse, &listener);
+        map_delete(&cgroup_udp_token, &cookie);
     }
-    map_delete(&cgroup_udp_token, &cookie);
-    map_delete(&cgroup_udp_peer, &cookie);
+    delete_present(&cgroup_udp_peer, &cookie);
 }
 
 INLINE bool store_connected_udp_token(
@@ -508,9 +510,10 @@ INLINE int handle_v4(
     } else {
         protocol = connect_hook ? ctx->protocol : UDP_VALUE;
     }
+    if (!protocol_selected(config, protocol)) return 1;
     __u16 port = swap16((__u16)ctx->user_port);
     __u64 cookie = get_socket_cookie(ctx);
-	if (base_bypass(cookie, config, protocol)) return 1;
+    if (is_cookie_bypassed(cookie)) return 1;
     __u32 destination = ctx->user_ip4;
     if (!connect_hook && restore_connected_token(
             ctx, cookie, false, destination == 0U || port == 0U)) {
@@ -601,9 +604,10 @@ INLINE int handle_v6(
     } else {
         protocol = connect_hook ? ctx->protocol : UDP_VALUE;
     }
+    if (!protocol_selected(config, protocol)) return 1;
     __u16 port = swap16((__u16)ctx->user_port);
     __u64 cookie = get_socket_cookie(ctx);
-	if (base_bypass(cookie, config, protocol)) return 1;
+    if (is_cookie_bypassed(cookie)) return 1;
     bool missing_destination =
         (address[0] | address[1] | address[2] | address[3]) == 0U || port == 0U;
     if (!connect_hook && restore_connected_token(ctx, cookie, true, missing_destination)) return 1;
@@ -832,8 +836,10 @@ INLINE int release_socket_cookie(__u64 cookie, __u64 released_at_ns) {
         map_delete(&cgroup_udp_token_reverse, listener);
         map_delete(&cgroup_udp_token, &cookie);
     }
-    map_delete(&cgroup_udp_peer, &(__u64){cookie});
-    map_delete(&cgroup_socket_bypass, &cookie);
+    // Every socket in the cgroup is released through here, and only connected
+    // UDP and self-bypass sockets own these entries.
+    delete_present(&cgroup_udp_peer, &cookie);
+    delete_present(&cgroup_socket_bypass, &cookie);
     return 1;
 }
 
