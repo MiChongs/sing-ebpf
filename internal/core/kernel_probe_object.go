@@ -105,7 +105,11 @@ func loadCgroupProbeObject(plan kernelProbePlan) (string, error) {
 	if runtime.GOOS == "android" {
 		mapCapacity = CompactCgroupMapCapacity()
 	}
-	if err = prepareCgroupMaps(runtimeState, mapCapacity, 0, 0, selfBypass.Map()); err == nil {
+	selfBypassMap, err := selfBypass.PreparedMap()
+	if err == nil {
+		err = prepareCgroupMaps(runtimeState, mapCapacity, 0, 0, selfBypassMap)
+	}
+	if err == nil {
 		runtimeState.programs, err = backend.loadCgroupObjectPrograms()
 	}
 	detail := "Loaded the generated cgroup programs and their real map specifications without attaching cgroup hooks."

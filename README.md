@@ -131,6 +131,14 @@ cgroup path does not help; the TC data plane is the alternative. At startup, wit
 the backend reclaims its own stale programs and any `sb_proc_*` program left as
 the sole single-program owner of a hook by an earlier build.
 
+`NewSelfBypass` creates no kernel object. Consumers build it while
+constructing their configuration, which also happens in unprivileged
+configuration checks (for example a desktop client's check worker); the
+socket-cookie map is created on first use instead: data-plane preparation,
+cgroup attachment, or the first socket registration. Data planes obtain it
+through `PreparedMap`, so a creation failure stops startup instead of leaving
+the data plane with a private map that never sees registered sockets.
+
 The interception cgroup is independent of an optional exclusive process cgroup
 used for self-bypass. A broad interception cgroup still excludes consumer-owned
 sockets through the shared cookie map. Userspace socket controls remain the

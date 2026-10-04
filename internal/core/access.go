@@ -34,21 +34,33 @@ func UnwrapSelfBypass(value any) *SelfBypass {
 
 func PrepareCgroupWithSelfBypass(config CgroupConfig, value any) (*CgroupBackend, error) {
 	if bypass := UnwrapSelfBypass(value); bypass != nil {
-		config.SelfBypassMap = bypass.Map()
+		sockets, err := bypass.PreparedMap()
+		if err != nil {
+			return nil, err
+		}
+		config.SelfBypassMap = sockets
 	}
 	return PrepareCgroup(config)
 }
 
 func AttachProcessTrackerWithSelfBypass(config ProcessTrackerConfig, value any) (*ProcessTracker, error) {
 	if bypass := UnwrapSelfBypass(value); bypass != nil {
-		config.MetadataMap = bypass.Map()
+		sockets, err := bypass.PreparedMap()
+		if err != nil {
+			return nil, err
+		}
+		config.MetadataMap = sockets
 	}
 	return AttachProcessTracker(config)
 }
 
 func PrepareTCWithSelfBypass(config TCConfig, value any) (*TCBackend, error) {
 	if bypass := UnwrapSelfBypass(value); bypass != nil {
-		config.SelfBypassMap = bypass.Map()
+		sockets, err := bypass.PreparedMap()
+		if err != nil {
+			return nil, err
+		}
+		config.SelfBypassMap = sockets
 	}
 	return PrepareTC(config)
 }
