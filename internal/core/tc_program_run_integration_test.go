@@ -14,6 +14,7 @@ import (
 
 func TestTCProgramRunIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "run unified TC eBPF programs in the kernel")
+	requireTCSocketAssignment(t)
 	policy, err := CompileActionPolicy(ActionPolicy{
 		EnableTCP: true,
 		Local:     ActionScope{Default: DecisionIntercept},
@@ -127,6 +128,7 @@ func TestForceInterceptPolicyPrecedenceIntegration(t *testing.T) {
 	bypass := []CIDRDecision{{Prefix: netip.MustParsePrefix("198.18.0.0/15"), Action: DecisionPass}, {Prefix: netip.MustParsePrefix("fd00:198:18::/48"), Action: DecisionPass}}
 
 	t.Run("socket_assign", func(t *testing.T) {
+		requireTCSocketAssignment(t)
 		backend, err := PrepareTC(TCConfig{
 			ListenerPort:     65531,
 			EnableShared:     true,
@@ -201,6 +203,7 @@ func forceInterceptPolicyPrecedencePackets() map[string][]byte {
 
 func TestTCIPv6PathIsolationIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "verify TC eBPF IPv6 path isolation")
+	requireTCSocketAssignment(t)
 	packet := testIPv6TCPPacket(
 		netip.MustParseAddr("2001:db8::10"), netip.MustParseAddr("2001:4860:4860::8888"), 53000, 443, nil,
 	)
@@ -269,6 +272,7 @@ func TestTCIPv6PathIsolationIntegration(t *testing.T) {
 
 func TestTCFragmentPolicyIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "verify TC eBPF fragment policy")
+	requireTCSocketAssignment(t)
 	backend, err := PrepareTC(TCConfig{
 		ListenerPort:     65531,
 		EnableShared:     true,

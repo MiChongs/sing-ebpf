@@ -160,7 +160,9 @@ func TestCgroupUDPRecoverySweepRemovesExpiredEntries(t *testing.T) {
 	if err = updateMap(backend.udpRecoveryMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
 		t.Fatal(err)
 	}
-	result, err := backend.SweepUDPRecovery(time.Second, 1024)
+	// The sweep cannot find anything stale while the uptime is below its
+	// idle limit, so keep the limit short enough for a freshly booted VM.
+	result, err := backend.SweepUDPRecovery(time.Millisecond, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,8 +481,24 @@ func assertCgroupUDPMapHandoff(t *testing.T, backend *CgroupBackend) {
 	if _, err = backend.TakeOriginal(ProtocolUDP, listener); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = backend.LookupOriginal(ProtocolUDP, listener); !errors.Is(err, unix.ENOENT) {
-		t.Fatalf("UDP redirect remained after take: %v", err)
+	assertCgroupRedirectTaken(t, backend, ProtocolUDP, listener)
+}
+
+// assertCgroupRedirectTaken checks the entry after TakeOriginal. Without
+// BPF_MAP_LOOKUP_AND_DELETE_ELEM for hash maps (before Linux 5.14) the take
+// deliberately leaves the entry for expiry instead of emulating the atomic
+// consume with a lookup and a separate delete.
+func assertCgroupRedirectTaken(t *testing.T, backend *CgroupBackend, protocol uint8, listener netip.AddrPort) {
+	t.Helper()
+	_, err := backend.LookupOriginal(protocol, listener)
+	if backend.lookupAndDeleteMode.Load() == mapLookupAndDeleteUnsupported {
+		if err != nil {
+			t.Fatalf("redirect was removed although lookup-and-delete is unsupported: %v", err)
+		}
+		return
+	}
+	if !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("redirect remained after take: %v", err)
 	}
 }
 
@@ -509,9 +527,7 @@ func assertCgroupTCPMapHandoff(t *testing.T, backend *CgroupBackend) {
 	if recovered.Destination != netip.MustParseAddrPort("192.0.2.20:443") {
 		t.Fatalf("unexpected TCP original destination: got %s", recovered.Destination)
 	}
-	if _, err = backend.LookupOriginal(ProtocolTCP, listener); !errors.Is(err, unix.ENOENT) {
-		t.Fatalf("TCP redirect remained after take: %v", err)
-	}
+	assertCgroupRedirectTaken(t, backend, ProtocolTCP, listener)
 }
 
 func cgroupIntegrationUnavailable(err error) bool {
