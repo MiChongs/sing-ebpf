@@ -54,13 +54,16 @@ var cgroupProgramDefinitions = [cgroupProgramCount]cgroupProgramDefinition{
 }
 
 type cgroupRuntime struct {
-	cgroupFile                  *os.File
-	slot                        *InstanceSlot
-	maps                        map[string]*CiliumEBPF.Map
-	programs                    []*CiliumEBPF.Program
-	links                       [cgroupProgramCount]link.Link
-	attached                    [cgroupProgramCount]bool
-	attach_modes                [cgroupProgramCount]string
+	cgroupFile   *os.File
+	slot         *InstanceSlot
+	maps         map[string]*CiliumEBPF.Map
+	programs     []*CiliumEBPF.Program
+	links        [cgroupProgramCount]link.Link
+	attached     [cgroupProgramCount]bool
+	attach_modes [cgroupProgramCount]string
+	// displaced holds, per legacy attachment, the netd placeholder it
+	// replaced on a single-program hook; detach puts it back.
+	displaced                   [cgroupProgramCount]*displacedCgroupOwner
 	control_map_fd              int
 	tcp_redirect_map_fd         int
 	udp_redirect_map_fd         int
