@@ -25,7 +25,7 @@ func TestRawCgroupAttachPrefersMulti(t *testing.T) {
 		options = current
 		return nil
 	}
-	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCgroupInetSockRelease)
+	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCgroupInetSockRelease)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestRawCgroupAttachFallsBackToExclusiveAfterMultiCompatibilityError(t *test
 		}
 		return nil
 	}
-	if err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
+	if _, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(flags, []uint32{unix.BPF_F_ALLOW_MULTI, 0}) {
@@ -96,7 +96,7 @@ func TestRawCgroupAttachPreservesExistingOwner(t *testing.T) {
 	queryCgroupPrograms = func(link.QueryOptions) (*link.QueryResult, error) {
 		return &link.QueryResult{Programs: []link.AttachedProgram{{ID: 1}}}, nil
 	}
-	if err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err == nil {
+	if _, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err == nil {
 		t.Fatal("existing cgroup owner was replaced")
 	}
 	if !slices.Equal(flags, []uint32{unix.BPF_F_ALLOW_MULTI}) {
@@ -128,7 +128,7 @@ func TestRawCgroupAttachOccupiedErrorNamesOwners(t *testing.T) {
 		}
 		return "id=57 name=foreign_conn4"
 	}
-	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
 	if !errors.Is(err, ErrCgroupHookOccupied) {
 		t.Fatalf("error = %v, want ErrCgroupHookOccupied", err)
 	}
@@ -163,7 +163,7 @@ func TestRawCgroupAttachFallbackErrors(t *testing.T) {
 				}
 				return nil
 			}
-			if err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
+			if _, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
 				t.Fatal(err)
 			}
 			if !slices.Equal(flags, []uint32{unix.BPF_F_ALLOW_MULTI, 0}) {
@@ -182,7 +182,7 @@ func TestRawCgroupAttachDoesNotFallbackOnFatalError(t *testing.T) {
 		callCount++
 		return wantErr
 	}
-	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
 	}

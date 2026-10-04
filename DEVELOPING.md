@@ -128,17 +128,28 @@ legacy TCP lookup, an MPTCP TCP listener (the Go default since Go 1.24, which a
 SOCKMAP rejects) → listener lookup by port, which needs a wildcard bind,
 cgroup socket-release notification → bounded LRU cleanup,
 socket-release probe permission denial → the same bounded LRU cleanup, and
-cgroup multi-program → compatible legacy exclusive attachment. Do not turn
+cgroup multi-program → compatible legacy exclusive attachment, and a root hook
+held by the Android 15+ netd pass-through placeholder → unflagged replacement
+of that placeholder, restored on detach. Do not turn
 an optional fallback failure into a silent feature claim; diagnostics must name
 the effective path. In particular, the runtime cgroup diagnostics distinguish
-`link_create`, `legacy_multi`, `legacy_exclusive`, and `mixed` attachment paths,
+`link_create`, `legacy_multi`, `legacy_exclusive`, `legacy_netd_replace`, and
+`mixed` attachment paths,
 as well as the effective UDP cleanup, socket-storage, and time-source modes.
 The socket-release capability probe is deliberately multi-only: it must never
 fall back to an unflagged attach that could replace an existing cgroup owner.
 The ordinary cgroup hook attach may still use the legacy-exclusive fallback
 after querying for an existing owner, but only for the interception backend
 (which has no other fallback) and the self-bypass hooks in an exclusive process
-cgroup. Optional components that share a cgroup with the interception backend,
+cgroup. The only existing owner it replaces is a pass-through recognized in
+`cgroup_netd.go`: the lone owner of a hook in single-program or override mode
+whose translated instructions reduce to `r0 = 1; exit`. Names, BTF and pins
+vary across netd builds and are consulted only when the kernel withholds the
+instructions. The replacement and the restore use the hook's own flags, so the
+hook never leaves the mode netd's restart path requires. The displaced program
+is kept open and put back by the same code that detaches ours. Startup reclaim
+of a stale takeover on a netd device swaps in netd's pin or an `sb_hook_allow`
+pass-through rather than emptying the hook. Optional components that share a cgroup with the interception backend,
 such as the process tracker on the cgroup v2 root, use
 `attachCgroupProgramShared`: a single-program hook would make the kernel reject
 the backend's own multi-program or link attachment on that hook. Startup

@@ -36,12 +36,26 @@ func dedicatedHookOwnerCgroup(t *testing.T, index int) (string, *os.File) {
 
 func newHookOwnerTestProgram(t *testing.T, name string) *CiliumEBPF.Program {
 	t.Helper()
+	return newHookOwnerTestProgramWith(t, name, asm.Instructions{asm.Mov.Imm(asm.R0, 1), asm.Return()})
+}
+
+// effectfulHookOwnerInstructions read the socket address before allowing, so
+// they are not a pass-through and no backend may take the hook over from
+// them.
+var effectfulHookOwnerInstructions = asm.Instructions{
+	asm.LoadMem(asm.R2, asm.R1, 0, asm.Word),
+	asm.Mov.Imm(asm.R0, 1),
+	asm.Return(),
+}
+
+func newHookOwnerTestProgramWith(t *testing.T, name string, instructions asm.Instructions) *CiliumEBPF.Program {
+	t.Helper()
 	program, err := CiliumEBPF.NewProgram(&CiliumEBPF.ProgramSpec{
 		Name:         name,
 		Type:         CiliumEBPF.CGroupSockAddr,
 		AttachType:   CiliumEBPF.AttachCGroupInet4Connect,
 		License:      "GPL",
-		Instructions: asm.Instructions{asm.Mov.Imm(asm.R0, 1), asm.Return()},
+		Instructions: instructions,
 	})
 	if err != nil {
 		if cgroupIntegrationUnavailable(err) {
@@ -57,7 +71,11 @@ func newHookOwnerTestProgram(t *testing.T, name string) *CiliumEBPF.Program {
 // an attachment left behind by a process that has exited.
 func attachExclusiveTestProgram(t *testing.T, cgroupFile *os.File, name string) CiliumEBPF.ProgramID {
 	t.Helper()
-	program := newHookOwnerTestProgram(t, name)
+	return attachExclusiveTestProgramWith(t, cgroupFile, newHookOwnerTestProgram(t, name))
+}
+
+func attachExclusiveTestProgramWith(t *testing.T, cgroupFile *os.File, program *CiliumEBPF.Program) CiliumEBPF.ProgramID {
+	t.Helper()
 	defer program.Close()
 	err := link.RawAttachProgram(link.RawAttachProgramOptions{
 		Target:  int(cgroupFile.Fd()),
@@ -158,13 +176,18 @@ func TestCgroupBackendReclaimsStaleExclusiveProcessTrackerIntegration(t *testing
 	}
 }
 
-// A foreign single-program owner must survive and be named in the error.
+// A foreign single-program owner that does real work must survive and be
+// named in the error, together with the reason it was kept.
 func TestCgroupBackendPreservesForeignExclusiveOwnerIntegration(t *testing.T) {
 	path, cgroupFile := dedicatedHookOwnerCgroup(t, 92)
-	foreignID := attachExclusiveTestProgram(t, cgroupFile, "foreign_conn4")
+	foreignID := attachExclusiveTestProgramWith(t, cgroupFile,
+		newHookOwnerTestProgramWith(t, "foreign_conn4", effectfulHookOwnerInstructions))
 	_, err := attachTCPCgroupBackend(t, path, 41092)
 	if !errors.Is(err, ErrCgroupHookOccupied) {
 		t.Fatalf("attach error = %v, want ErrCgroupHookOccupied", err)
+	}
+	if !errors.Is(err, errCgroupOwnerHasEffect) {
+		t.Fatalf("attach error = %v, want it explained by errCgroupOwnerHasEffect", err)
 	}
 	if !strings.Contains(err.Error(), "name=foreign_conn4") {
 		t.Fatalf("attach error %q does not name the foreign owner", err)

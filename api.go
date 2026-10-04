@@ -115,7 +115,10 @@ const (
 
 // ErrCgroupHookOccupied is matched with errors.Is when a cgroup attachment is
 // refused because the hook already holds a program in single-program mode.
-// The error text names the programs currently attached to that hook.
+// The error text names the programs currently attached to that hook and why
+// the owner was kept. A pass-through owner, such as the placeholder Android
+// 15+ netd keeps on the root socket-address hooks, is not refused: it is
+// replaced for the backend's lifetime and restored on detach.
 var ErrCgroupHookOccupied = core.ErrCgroupHookOccupied
 
 type SelfBypass struct {

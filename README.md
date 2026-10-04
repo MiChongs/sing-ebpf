@@ -123,15 +123,35 @@ socket-release owner merely to test the optional capability.
 
 The kernel puts a cgroup hook in single-program mode when a program is attached
 without `BPF_F_ALLOW_MULTI`, and then rejects every multi-program attachment on
-that hook, `BPF_LINK_CREATE` included. The backend never displaces such an
-owner: attachment fails with `ErrCgroupHookOccupied`, whose message names the
-programs on the hook. A foreign owner attached without any flag to the cgroup
-v2 root also blocks that hook in every descendant cgroup, so selecting another
-cgroup path does not help; the TC data plane is the alternative. At startup the
-backend reclaims stale interception programs (all of them when no other backend
-is alive on the cgroup, otherwise only those of its own instance slot) and any
-`sb_proc_*` program left as the sole single-program owner of a hook by an
-earlier build.
+that hook, `BPF_LINK_CREATE` included. The backend displaces exactly one kind
+of such owner: a pass-through, such as the placeholder (`return BPF_ALLOW`)
+that Android 15+ netd attaches to the connect, sendmsg and recvmsg hooks of
+the cgroup v2 root. The owner must be the single program of a hook in
+single-program (or override) mode, and its translated instructions must reduce
+to `r0 = 1; exit`. Program names, BTF and pin paths differ between AOSP,
+vendor and custom-ROM netd builds, so they are not part of the decision. Only
+when the kernel withholds the instructions is the owner accepted on identity,
+and then only if it is netd's pinned program. The owner is replaced
+atomically with an attach that uses the hook's own flags, so the hook keeps
+the single-program mode a restarting netd depends on. This is reported as
+attach mode `legacy_netd_replace`. The owner is held open and attached again
+when the backend detaches, so the hook ends up as netd left it. netd's
+socket-release program does traffic-accounting cleanup and is never displaced;
+UDP cleanup then uses the LRU fallback on those devices. Every other owner is
+kept: attachment fails with `ErrCgroupHookOccupied`, whose message names the
+programs on the hook and why the owner was kept. While the backend holds such
+a hook, it is the hook's only program, so a second backend or the process
+tracker cannot attach there. A foreign owner attached without any flag to the
+cgroup v2 root also blocks that hook in every descendant cgroup, so selecting
+another cgroup path does not help; the TC data plane is the alternative. At
+startup the backend reclaims stale interception programs (all of them when no
+other backend is alive on the cgroup, otherwise only those of its own instance
+slot) and any `sb_proc_*` program left as the sole single-program owner of a
+hook by an earlier build. On a device with netd, a stale program that is the
+sole single-program owner of a takeable hook is swapped for netd's pinned
+program, or for an equivalent `sb_hook_allow` pass-through when that pin is
+not at hand, instead of being detached: an emptied hook would let the next
+attach put it in multi-program mode, and a restarting netd aborts on that.
 
 `NewSelfBypass` creates no kernel object. Consumers build it while
 constructing their configuration, which also happens in unprivileged

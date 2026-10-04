@@ -40,19 +40,27 @@ var describeCgroupProgram = func(id CiliumEBPF.ProgramID) string {
 // ErrCgroupHookOccupied reports that a cgroup hook already holds a program in
 // single-program (exclusive or override) mode. The kernel rejects every
 // multi-program attachment on such a hook, including BPF_LINK_CREATE, and the
-// only remaining operation would displace that program. sing-ebpf never does
-// that, so callers must choose another data plane or free the hook.
+// only remaining operation would displace that program. sing-ebpf does that
+// only for a pass-through owner, such as the placeholder Android 15+ netd
+// keeps on the root socket-address hooks, and restores it on detach. Every
+// other owner is kept, so callers must choose another data plane or free the
+// hook.
 var ErrCgroupHookOccupied = errors.New("refusing to replace existing cgroup program owner")
 
 type cgroupHookOccupiedError struct {
 	attachType CiliumEBPF.AttachType
 	owners     []string
+	// detail explains why a recognized owner was still not replaced.
+	detail error
 }
 
 func (e *cgroupHookOccupiedError) Error() string {
 	message := ErrCgroupHookOccupied.Error() + " on " + e.attachType.String()
 	if len(e.owners) > 0 {
 		message += " (" + strings.Join(e.owners, ", ") + ")"
+	}
+	if e.detail != nil {
+		message += ": " + e.detail.Error()
 	}
 	return message
 }
@@ -61,12 +69,16 @@ func (e *cgroupHookOccupiedError) Unwrap() error {
 	return ErrCgroupHookOccupied
 }
 
-func newCgroupHookOccupiedError(attachType CiliumEBPF.AttachType, programs []link.AttachedProgram) error {
+func (e *cgroupHookOccupiedError) Is(target error) bool {
+	return target == ErrCgroupHookOccupied || e.detail != nil && errors.Is(e.detail, target)
+}
+
+func newCgroupHookOccupiedError(attachType CiliumEBPF.AttachType, programs []link.AttachedProgram, detail error) error {
 	owners := make([]string, 0, len(programs))
 	for _, program := range programs {
 		owners = append(owners, describeCgroupProgram(program.ID))
 	}
-	return &cgroupHookOccupiedError{attachType: attachType, owners: owners}
+	return &cgroupHookOccupiedError{attachType: attachType, owners: owners, detail: detail}
 }
 
 var loadTC = BPFGen.LoadTC
@@ -79,9 +91,30 @@ var loadSharedNetwork = BPFGen.LoadSharedNetwork
 
 var loadICMPEchoReply = BPFGen.LoadICMPEchoReply
 
-func attachProgramRaw(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
-	_, err := attachProgramRawWithMode(target, program, attachType)
-	return err
+// legacyCgroupAttachment describes a successful legacy BPF_PROG_ATTACH: the
+// variant that succeeded and, for cgroupAttachModeNetdReplace, the program it
+// displaced, which the owner of the attachment must restore on detach.
+type legacyCgroupAttachment struct {
+	mode      string
+	displaced *displacedCgroupOwner
+}
+
+const (
+	cgroupAttachModeLinkCreate      = "link_create"
+	cgroupAttachModeLegacyMulti     = "legacy_multi"
+	cgroupAttachModeLegacyExclusive = "legacy_exclusive"
+	// cgroupAttachModeNetdReplace is an unflagged attach that replaced the
+	// pass-through placeholder Android netd holds on the hook. The hook stays
+	// in single-program mode and the placeholder returns on detach.
+	cgroupAttachModeNetdReplace = "legacy_netd_replace"
+)
+
+func attachProgramRaw(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (*displacedCgroupOwner, error) {
+	attachment, err := attachProgramRawWithMode(target, program, attachType)
+	if err != nil {
+		return nil, err
+	}
+	return attachment.displaced, nil
 }
 
 // attachProgramRawMultiOnly is used for optional capability probes and for
@@ -105,7 +138,7 @@ func attachProgramRawMultiOnly(target int, program *CiliumEBPF.Program, attachTy
 // vendor kernel can reject BPF_F_ALLOW_MULTI while still accepting the
 // single-program legacy operation. Callers must expose the effective path,
 // not merely the attempted fast path.
-func attachProgramRawWithMode(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (string, error) {
+func attachProgramRawWithMode(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (legacyCgroupAttachment, error) {
 	options := link.RawAttachProgramOptions{
 		Target:  target,
 		Program: program,
@@ -114,21 +147,31 @@ func attachProgramRawWithMode(target int, program *CiliumEBPF.Program, attachTyp
 	}
 	multiErr := rawAttachProgram(options)
 	if multiErr == nil {
-		return "legacy_multi", nil
+		return legacyCgroupAttachment{mode: cgroupAttachModeLegacyMulti}, nil
 	}
 	if !cgroupMultiAttachUnavailable(multiErr) {
-		return "", multiErr
+		return legacyCgroupAttachment{}, multiErr
 	}
-	// An unflagged legacy attach replaces the current exclusive owner. Do not
-	// displace a vendor/OS cgroup hook that we cannot restore after shutdown.
-	// Optional components fall back to userspace; the interception backend has
-	// no such fallback and reports ErrCgroupHookOccupied, naming the current
-	// owners so the operator can tell a foreign program from a stale one of
-	// ours. Kernels without BPF_PROG_QUERY retain the historical fallback
-	// because there is no safe way to distinguish an empty hook from an
-	// unqueryable one.
+	// An unflagged legacy attach replaces the current exclusive owner. The one
+	// owner that is replaced is a pass-through, such as the placeholder
+	// Android 15+ netd keeps on the root socket-address hooks; it is held open
+	// and restored on detach (see cgroup_netd.go). Any owner that does real
+	// work is left alone. Optional components fall
+	// back to userspace; the interception backend has no such fallback and
+	// reports ErrCgroupHookOccupied, naming the current owners so the
+	// operator can tell a foreign program from a stale one of ours. Kernels
+	// without BPF_PROG_QUERY retain the historical fallback because there is
+	// no safe way to distinguish an empty hook from an unqueryable one.
 	if result, queryErr := queryCgroupPrograms(link.QueryOptions{Target: target, Attach: attachType}); queryErr == nil && len(result.Programs) > 0 {
-		return "", newCgroupHookOccupiedError(attachType, result.Programs)
+		displaced, keptReason := displaceableCgroupOwner(target, attachType, result.Programs)
+		if displaced == nil {
+			return legacyCgroupAttachment{}, newCgroupHookOccupiedError(attachType, result.Programs, keptReason)
+		}
+		if err := replaceCgroupOwner(target, program, attachType, displaced.flags); err != nil {
+			_ = displaced.Close()
+			return legacyCgroupAttachment{}, err
+		}
+		return legacyCgroupAttachment{mode: cgroupAttachModeNetdReplace, displaced: displaced}, nil
 	}
 	// Keep the legacy fallback used before multi-only attachment was adopted.
 	// Some vendor kernels reject ALLOW_MULTI for otherwise usable hooks. An
@@ -136,9 +179,9 @@ func attachProgramRawWithMode(target int, program *CiliumEBPF.Program, attachTyp
 	// is attempted only after errors known to indicate unavailable multi attach.
 	options.Flags = 0
 	if err := rawAttachProgram(options); err != nil {
-		return "", err
+		return legacyCgroupAttachment{}, err
 	}
-	return "legacy_exclusive", nil
+	return legacyCgroupAttachment{mode: cgroupAttachModeLegacyExclusive}, nil
 }
 
 func cgroupMultiAttachUnavailable(err error) bool {
@@ -147,7 +190,9 @@ func cgroupMultiAttachUnavailable(err error) bool {
 		errors.Is(err, linuxErrnoNotSupported)
 }
 
-func rawDetachProgram(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
+// rawDetachProgram is a variable so tests can observe the detach that
+// precedes restoring a displaced owner without a kernel object.
+var rawDetachProgram = func(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
 	return link.RawDetachProgram(link.RawDetachProgramOptions{Target: target, Program: program, Attach: attachType})
 }
 

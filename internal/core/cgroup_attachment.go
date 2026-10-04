@@ -101,10 +101,11 @@ func attachCgroupProgramWithPolicy(
 		_ = cgroupFile.Close()
 		return nil, linkErr
 	}
+	var displaced *displacedCgroupOwner
 	if policy == cgroupAttachMultiOnly {
 		err = attachProgramRawMultiOnly(int(cgroupFile.Fd()), program, attachType)
 	} else {
-		err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType)
+		displaced, err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType)
 	}
 	if err != nil {
 		_ = cgroupFile.Close()
@@ -114,6 +115,7 @@ func attachCgroupProgramWithPolicy(
 		cgroupFile: cgroupFile,
 		program:    program,
 		attachType: attachType,
+		displaced:  displaced,
 	}, nil
 }
 
@@ -121,6 +123,9 @@ type legacyCgroupProgramLink struct {
 	cgroupFile *os.File
 	program    *CiliumEBPF.Program
 	attachType CiliumEBPF.AttachType
+	// displaced is the netd placeholder this attachment replaced, if any. It
+	// goes back on the hook when the attachment is closed.
+	displaced *displacedCgroupOwner
 	// detachProgram is nil in production. Tests inject a transient detach
 	// failure to prove that the target FD remains owned for a cleanup retry.
 	detachProgram func(int, *CiliumEBPF.Program, CiliumEBPF.AttachType) error
@@ -130,13 +135,20 @@ func (l *legacyCgroupProgramLink) Close() error {
 	if l == nil || l.cgroupFile == nil {
 		return nil
 	}
-	detachProgram := l.detachProgram
-	if detachProgram == nil {
-		detachProgram = rawDetachProgram
-	}
-	detachErr := detachProgram(int(l.cgroupFile.Fd()), l.program, l.attachType)
-	if detachErr != nil && !errors.Is(detachErr, unix.ENOENT) && !errors.Is(detachErr, unix.ESRCH) {
-		return detachErr
+	if l.displaced != nil {
+		if err := restoreDisplacedCgroupOwner(int(l.cgroupFile.Fd()), l.program, l.displaced, l.attachType); err != nil {
+			return err
+		}
+		l.displaced = nil
+	} else {
+		detachProgram := l.detachProgram
+		if detachProgram == nil {
+			detachProgram = rawDetachProgram
+		}
+		detachErr := detachProgram(int(l.cgroupFile.Fd()), l.program, l.attachType)
+		if detachErr != nil && !errors.Is(detachErr, unix.ENOENT) && !errors.Is(detachErr, unix.ESRCH) {
+			return detachErr
+		}
 	}
 	closeErr := l.cgroupFile.Close()
 	l.cgroupFile = nil
@@ -418,6 +430,24 @@ func detachOwnedCgroupPrograms(cgroupFD int, slot int) error {
 				return infoErr
 			}
 			if reclaimableCgroupProgram(info.Name, slot, hookFlags, len(first)) {
+				// A stale program that is the sole single-program owner took the
+				// hook over from Android netd and never gave it back. Put a netd
+				// placeholder back instead of emptying the hook; the ordinary
+				// attach then takes the hook over again and restores it on
+				// detach.
+				if hookFlags&unix.BPF_F_ALLOW_MULTI == 0 && len(first) == 1 {
+					restored, restoreErr := restoreNetdOwnerForStaleProgram(cgroupFD, definition.attachType, hookFlags)
+					if restoreErr != nil {
+						_ = program.Close()
+						return restoreErr
+					}
+					if restored {
+						if closeErr := program.Close(); closeErr != nil {
+							return closeErr
+						}
+						continue
+					}
+				}
 				// ENOENT: the program is attached through a link, so its owner is
 				// alive and only it can detach the program.
 				if detachErr := rawDetachProgram(cgroupFD, program, definition.attachType); detachErr != nil &&
@@ -477,12 +507,13 @@ func (b *CgroupBackend) Attach() error {
 		})
 		if err == nil {
 			b.runtime.links[slot] = programLink
-			b.runtime.attach_modes[slot] = "link_create"
+			b.runtime.attach_modes[slot] = cgroupAttachModeLinkCreate
 		} else if cgroupLinkUnavailable(err) {
-			var mode string
-			mode, err = attachProgramRawWithMode(cgroupFD, program, cgroupProgramDefinitions[slot].attachType)
+			var attachment legacyCgroupAttachment
+			attachment, err = attachProgramRawWithMode(cgroupFD, program, cgroupProgramDefinitions[slot].attachType)
 			if err == nil {
-				b.runtime.attach_modes[slot] = mode
+				b.runtime.attach_modes[slot] = attachment.mode
+				b.runtime.displaced[slot] = attachment.displaced
 			}
 		}
 		if err != nil {
@@ -528,6 +559,13 @@ func (b *CgroupBackend) detachProgramsLocked() error {
 				detachErr = E.Errors(detachErr, err)
 			}
 			continue
+		} else if displaced := b.runtime.displaced[slot]; displaced != nil {
+			// Put the netd placeholder back in place of our program. A
+			// failure keeps the displaced owner for a cleanup retry.
+			err = restoreDisplacedCgroupOwner(cgroupFD, b.runtime.programs[slot], displaced, cgroupProgramDefinitions[slot].attachType)
+			if err == nil {
+				b.runtime.displaced[slot] = nil
+			}
 		} else {
 			err = rawDetachProgram(cgroupFD, b.runtime.programs[slot], cgroupProgramDefinitions[slot].attachType)
 		}
