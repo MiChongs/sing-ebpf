@@ -26,16 +26,34 @@ const socketAssignTestListenerPort = 23457
 
 var socketAssignTestDestination = netip.MustParseAddrPort("203.0.113.10:443")
 
+// A plain TCP listener is placed in the SOCKMAP; an MPTCP listener cannot be
+// and is found by port instead.
+var socketAssignTestListenerKinds = []struct {
+	name  string
+	mptcp bool
+}{
+	{name: "tcp_listener"},
+	{name: "mptcp_listener", mptcp: true},
+}
+
 // These tests drive real TCP connections through the TC socket-assignment
 // paths. The consumer reads a TCP assignment once, when it accepts the
 // connection, and removes it; the established packets that follow must still
 // reach the accepted socket and must not recreate the consumed entry.
 
 func TestTCSharedSocketAssignmentDeliversEstablishedTCP(t *testing.T) {
+	for _, listenerKind := range socketAssignTestListenerKinds {
+		t.Run(listenerKind.name, func(t *testing.T) {
+			testTCSharedSocketAssignment(t, listenerKind.mptcp)
+		})
+	}
+}
+
+func testTCSharedSocketAssignment(t *testing.T, mptcp bool) {
 	enterTestNetworkNamespace(t)
 	setLoopbackUp(t)
 	backend := newSocketAssignTestBackend(t, false)
-	listener := listenTransparentTCP(t, backend)
+	listener := listenTransparentTCP(t, backend, mptcp)
 
 	router, peer := createTestVethPair(t, "sbsatcp0", "sbsatcp1")
 	addTestAddress(t, router, "10.251.0.1/24")
@@ -96,10 +114,18 @@ func TestTCSharedSocketAssignmentDeliversEstablishedTCP(t *testing.T) {
 }
 
 func TestTCLocalSocketAssignmentDeliversEstablishedTCP(t *testing.T) {
+	for _, listenerKind := range socketAssignTestListenerKinds {
+		t.Run(listenerKind.name, func(t *testing.T) {
+			testTCLocalSocketAssignment(t, listenerKind.mptcp)
+		})
+	}
+}
+
+func testTCLocalSocketAssignment(t *testing.T, mptcp bool) {
 	enterTestNetworkNamespace(t)
 	setLoopbackUp(t)
 	backend := newSocketAssignTestBackend(t, true)
-	listener := listenTransparentTCP(t, backend)
+	listener := listenTransparentTCP(t, backend, mptcp)
 
 	// The default interface has a gateway that answers no ARP; a permanent
 	// neighbour entry lets the connection's packets reach TC egress.
@@ -185,7 +211,7 @@ func newSocketAssignTestBackend(t *testing.T, local bool) *commonEBPF.TCBackend 
 	return backend
 }
 
-func listenTransparentTCP(t *testing.T, backend *commonEBPF.TCBackend) *net.TCPListener {
+func listenTransparentTCP(t *testing.T, backend *commonEBPF.TCBackend, mptcp bool) *net.TCPListener {
 	t.Helper()
 	config := net.ListenConfig{Control: func(_, _ string, conn syscall.RawConn) error {
 		var socketErr error
@@ -196,8 +222,7 @@ func listenTransparentTCP(t *testing.T, backend *commonEBPF.TCBackend) *net.TCPL
 		}
 		return socketErr
 	}}
-	// Go listeners default to MPTCP, and a SOCKMAP accepts only plain TCP.
-	config.SetMultipathTCP(false)
+	config.SetMultipathTCP(mptcp)
 	listener, err := config.Listen(context.Background(), "tcp4", fmt.Sprintf("0.0.0.0:%d", socketAssignTestListenerPort))
 	if err != nil {
 		t.Fatalf("listen on the transparent TCP socket: %v", err)
@@ -208,14 +233,27 @@ func listenTransparentTCP(t *testing.T, backend *commonEBPF.TCBackend) *net.TCPL
 	if err != nil {
 		t.Fatal(err)
 	}
+	sockmapBackend := backend.TCPListenerLookupMode() == "sockmap"
+	var protocol int
 	var registerErr error
 	if err = rawConn.Control(func(fd uintptr) {
+		protocol, _ = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_PROTOCOL)
 		registerErr = backend.RegisterTCPListener(false, int(fd))
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if mptcp && protocol != unix.IPPROTO_MPTCP {
+		t.Skip("the kernel does not provide MPTCP listeners")
+	}
 	if registerErr != nil {
 		t.Fatalf("register the transparent listener: %v", registerErr)
+	}
+	wantMode := "direct"
+	if sockmapBackend && !mptcp {
+		wantMode = "sockmap"
+	}
+	if mode := backend.TCPListenerLookupMode(); mode != wantMode {
+		t.Fatalf("listener lookup mode = %q, want %q", mode, wantMode)
 	}
 	return tcpListener
 }

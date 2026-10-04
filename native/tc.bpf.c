@@ -630,7 +630,7 @@ INLINE int parse_pass(int parsed, __u32 fragment_stat) {
 // be read here, where the skc_lookup_tcp result is not mixed with a SOCKMAP
 // listener.
 NOINLINE struct bpf_sock *lookup_tcp_socket(struct __sk_buff *skb,
-    const struct sb_tc_assign_key *key, bool *established) {
+    const struct sb_tc_control *control, const struct sb_tc_assign_key *key, bool *established) {
     struct bpf_sock_tuple tuple = {};
     __u32 tuple_size;
     if (key->family == AF_INET_VALUE) {
@@ -653,7 +653,17 @@ NOINLINE struct bpf_sock *lookup_tcp_socket(struct __sk_buff *skb,
     }
     if (socket != 0) sk_release(socket);
     __u32 listener = key->family == AF_INET_VALUE ? SB_TC_LISTENER_TCP4 : SB_TC_LISTENER_TCP6;
-    return map_lookup(&tc_listener_sockets, &listener);
+    struct bpf_sock *registered = map_lookup(&tc_listener_sockets, &listener);
+    if (registered != 0) return registered;
+    // A SOCKMAP holds only plain TCP sockets, so an MPTCP listener is not
+    // registered. Find its TCP subflow listener by port, as the legacy lookup
+    // does; this requires a wildcard bind.
+    if (key->family == AF_INET_VALUE) {
+        tuple.ipv4.dport = network_order16(control->listener_port);
+    } else {
+        tuple.ipv6.dport = network_order16(control->listener_port);
+    }
+    return skc_lookup_tcp(skb, &tuple, tuple_size, BPF_F_CURRENT_NETNS, 0U);
 }
 
 NOINLINE struct bpf_sock *lookup_tcp_socket_legacy(struct __sk_buff *skb,
@@ -741,7 +751,7 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
     path &= ~SB_TC_PATH_SOURCE_MAC_VALID;
     bool established = false;
     struct bpf_sock *socket = key->protocol == IPPROTO_TCP_VALUE
-        ? lookup_tcp_socket(skb, key, &established)
+        ? lookup_tcp_socket(skb, control, key, &established)
         : lookup_udp_socket(skb, control, key);
     if (socket == 0) {
         increment_stat(SB_TC_STAT_SOCKET_LOOKUP_FAILURE);
