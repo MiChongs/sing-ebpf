@@ -227,7 +227,9 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries), len(policy.localBypassPortEntries), config.SelfBypassMap); err != nil {
 		_ = closeMaps(runtimeState.maps)
 		_ = runtimeState.cgroupFile.Close()
-		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
+		if errors.Is(err, unix.EPERM) {
+			err = explainBPFPermissionError(err, memlockErr)
+		} else if memlockErr != nil && errors.Is(err, unix.ENOMEM) {
 			err = E.Errors(err, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, err

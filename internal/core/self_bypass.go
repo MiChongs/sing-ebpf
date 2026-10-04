@@ -85,7 +85,9 @@ func NewSelfBypassWithCapacity(capacity uint32) (*SelfBypass, error) {
 	if capacity == 0 || capacity > MaxConfigurableMapCapacity {
 		return nil, E.New("invalid eBPF self-bypass socket map capacity: ", capacity)
 	}
-	_ = raiseMemlockLimit()
+	// This is usually the first BPF object a consumer creates, so its EPERM is
+	// where a missing privilege first surfaces. Explain it precisely.
+	memlockErr := raiseMemlockLimit()
 	sockets, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
 		Name:       "sb_self_sockets",
 		Type:       CiliumEBPF.LRUHash,
@@ -94,7 +96,7 @@ func NewSelfBypassWithCapacity(capacity uint32) (*SelfBypass, error) {
 		MaxEntries: capacity,
 	})
 	if err != nil {
-		return nil, E.Cause(err, "create eBPF self-bypass socket map")
+		return nil, E.Cause(explainBPFPermissionError(err, memlockErr), "create eBPF self-bypass socket map")
 	}
 	return &SelfBypass{sockets: sockets}, nil
 }

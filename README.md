@@ -284,6 +284,18 @@ delivery veth. Any combination of local and shared choices is valid. Shutdown
 detaches each selected backend and removes only routes owned by that instance. A
 disabled path does not load its object or create network state.
 
+## Runtime privileges
+
+Creating the maps and programs needs `CAP_BPF` or `CAP_SYS_ADMIN` in the initial
+user namespace; attachment additionally needs `CAP_NET_ADMIN`, and startup
+cleanup reads attached programs by ID, which needs `CAP_SYS_ADMIN`. Run the
+consumer as root. Kernels before 5.11 also charge BPF memory to the per-user
+`RLIMIT_MEMLOCK` budget; the library raises it to unlimited, which needs
+`CAP_SYS_RESOURCE`. cilium/ebpf reports every `EPERM` from object creation as
+a possible memlock problem, so the library replaces that hint with the
+diagnosed cause: missing capabilities, a non-initial user namespace, or a
+memlock limit that could not be raised.
+
 ## Building, generation, and tests
 
 This section is the short path for consumers. Developers changing the BPF C,

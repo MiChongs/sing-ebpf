@@ -212,7 +212,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 	); err != nil {
 		return nil, err
 	}
-	_ = raiseMemlockLimit()
+	memlockErr := raiseMemlockLimit()
 	mapOverrides := map[string]mapSpecOverride{
 		"tc_control":             {name: "sb_tc_ctl", mapType: CiliumEBPF.Array, maxEntries: 1},
 		"tc_listener_sockets":    {name: "sb_tc_listen", mapType: CiliumEBPF.SockMap, maxEntries: 2},
@@ -252,7 +252,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		maps, loadedPrograms, err = loadTCResources(config, mapOverrides, true)
 	}
 	if err != nil {
-		return nil, err
+		return nil, explainBPFPermissionError(err, memlockErr)
 	}
 	controlValue := tcControl{
 		Flags:             tcFlags(config, policy),
