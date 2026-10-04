@@ -282,6 +282,25 @@ func loadObjectProgramsWithOptions(
 		MapReplacements: maps,
 		Programs:        programOptions,
 	})
+	if err != nil && !programOptions.LogDisabled && verifierLogRetryMaskedError(err) {
+		// cilium/ebpf retries a failed load with a growing verifier log. Before
+		// Linux 5.2 the kernel rejects a log buffer over 16 MiB with EINVAL
+		// before verifying, and that EINVAL replaces the real error, typically
+		// E2BIG from the verifier complexity limit. A load without a log
+		// reports the real one.
+		retryOptions := programOptions
+		retryOptions.LogDisabled = true
+		retryCollection, retryErr := CiliumEBPF.NewCollectionWithOptions(spec, CiliumEBPF.CollectionOptions{
+			MapReplacements: maps,
+			Programs:        retryOptions,
+		})
+		switch {
+		case retryErr == nil:
+			collection, err = retryCollection, nil
+		case !errors.Is(retryErr, unix.EINVAL):
+			err = retryErr
+		}
+	}
 	if err != nil {
 		return nil, eBPFOperationError("load eBPF programs", err)
 	}
@@ -296,6 +315,13 @@ func loadObjectProgramsWithOptions(
 	}
 	collection.Close()
 	return programs, nil
+}
+
+// verifierLogRetryMaskedError reports an EINVAL that came without any
+// verifier output, which is what a rejected verifier log buffer looks like.
+func verifierLogRetryMaskedError(err error) bool {
+	var verifierErr *CiliumEBPF.VerifierError
+	return errors.Is(err, unix.EINVAL) && errors.As(err, &verifierErr) && len(verifierErr.Log) == 0
 }
 
 func closePrograms(programs []*CiliumEBPF.Program) error {

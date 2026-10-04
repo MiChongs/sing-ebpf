@@ -44,6 +44,8 @@ func eBPFOperationError(operation string, err error) error {
 			return E.Cause(errno, "eBPF data plane is not supported by this kernel: ", operation)
 		case unix.EPERM, unix.EACCES:
 			return E.Cause(errno, "eBPF data plane is not permitted on this device: ", operation)
+		case unix.E2BIG:
+			return E.Cause(errno, "eBPF data plane exceeds this kernel's eBPF limits: ", operation)
 		}
 	}
 	return E.Cause(err, operation)

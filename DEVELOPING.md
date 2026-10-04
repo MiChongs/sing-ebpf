@@ -272,7 +272,12 @@ alone is not an attachment or traffic test.
 ## Debugging evidence
 
 For verifier failures, retain the complete verifier log and identify the exact
-object/program variant. For runtime failures, collect:
+object/program variant. Before Linux 5.2 the verifier rejects a log buffer over
+16 MiB with EINVAL and an empty log, so cilium/ebpf's growing log retry can
+hide the real error, typically E2BIG from the 131072-instruction complexity
+limit; the loader then repeats the load without a log to report it. Changes to
+the shared packet-rewrite ingress program should be loaded on a 4.19 kernel,
+which has the least verifier headroom. For runtime failures, collect:
 
 - active attachment descriptions and effective mechanisms;
 - first error and timestamp, recovery state, and retry deadline;

@@ -4,6 +4,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -408,5 +409,22 @@ func TestKernelProgramNames(t *testing.T) {
 			t.Fatalf("duplicate kernel program name: %s", name)
 		}
 		seen[name] = struct{}{}
+	}
+}
+
+func TestVerifierLogRetryMaskedError(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "rejected log buffer", err: fmt.Errorf("program p: %w", &CiliumEBPF.VerifierError{Cause: unix.EINVAL}), want: true},
+		{name: "verifier rejection", err: &CiliumEBPF.VerifierError{Cause: unix.EINVAL, Log: []string{"invalid func unknown#99"}}, want: false},
+		{name: "complexity limit", err: &CiliumEBPF.VerifierError{Cause: unix.E2BIG}, want: false},
+		{name: "no verifier error", err: unix.EINVAL, want: false},
+	} {
+		if got := verifierLogRetryMaskedError(testCase.err); got != testCase.want {
+			t.Errorf("%s: verifierLogRetryMaskedError = %v, want %v", testCase.name, got, testCase.want)
+		}
 	}
 }
