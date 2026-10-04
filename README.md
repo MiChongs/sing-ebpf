@@ -121,6 +121,24 @@ otherwise it uses bounded LRU recovery. The probe never performs an
 unflagged legacy attach, so it cannot replace an existing Android/netd
 socket-release owner merely to test the optional capability.
 
+The kernel puts a cgroup hook in single-program mode when a program is attached
+without `BPF_F_ALLOW_MULTI`, and then rejects every multi-program attachment on
+that hook, `BPF_LINK_CREATE` included. The backend never displaces such an
+owner: attachment fails with `ErrCgroupHookOccupied`, whose message names the
+programs on the hook. A foreign owner attached without any flag to the cgroup
+v2 root also blocks that hook in every descendant cgroup, so selecting another
+cgroup path does not help; the TC data plane is the alternative. At startup, with the cgroup locked,
+the backend reclaims its own stale programs and any `sb_proc_*` program left as
+the sole single-program owner of a hook by an earlier build.
+
+`NewSelfBypass` creates no kernel object. Consumers build it while
+constructing their configuration, which also happens in unprivileged
+configuration checks (for example a desktop client's check worker); the
+socket-cookie map is created on first use instead: data-plane preparation,
+cgroup attachment, or the first socket registration. Data planes obtain it
+through `PreparedMap`, so a creation failure stops startup instead of leaving
+the data plane with a private map that never sees registered sockets.
+
 The interception cgroup is independent of an optional exclusive process cgroup
 used for self-bypass. A broad interception cgroup still excludes consumer-owned
 sockets through the shared cookie map. Userspace socket controls remain the
@@ -140,8 +158,11 @@ socket cookie used to recover the process owner. The separate
 consulted by local egress before any packet interception.
 The optional cgroup socket-address tracker records cookie, PID, and UID in a
 bounded LRU map. Userspace then reads only `/proc/<pid>/exe` instead of scanning
-all process file descriptors. If the tracker cannot be attached, normal route
-process search remains the fallback. A cgroup `sock_release` hook removes owner
+all process file descriptors. The tracker always attaches to the cgroup v2
+root, which is also the default interception cgroup, so it uses only
+multi-program attachment and never leaves a root hook in single-program mode.
+If the tracker cannot be attached, normal route process search remains the
+fallback. A cgroup `sock_release` hook removes owner
 records immediately when supported; otherwise the bounded LRU map remains the
 cleanup fallback. Its capability probe is multi-only and does not displace an
 existing cgroup owner.
@@ -270,6 +291,18 @@ routes. Shared `socket_assign` uses TC listeners and policy routing without a
 delivery veth. Any combination of local and shared choices is valid. Shutdown
 detaches each selected backend and removes only routes owned by that instance. A
 disabled path does not load its object or create network state.
+
+## Runtime privileges
+
+Creating the maps and programs needs `CAP_BPF` or `CAP_SYS_ADMIN` in the initial
+user namespace; attachment additionally needs `CAP_NET_ADMIN`, and startup
+cleanup reads attached programs by ID, which needs `CAP_SYS_ADMIN`. Run the
+consumer as root. Kernels before 5.11 also charge BPF memory to the per-user
+`RLIMIT_MEMLOCK` budget; the library raises it to unlimited, which needs
+`CAP_SYS_RESOURCE`. cilium/ebpf reports every `EPERM` from object creation as
+a possible memlock problem, so the library replaces that hint with the
+diagnosed cause: missing capabilities, a non-initial user namespace, or a
+memlock limit that could not be raised.
 
 ## Building, generation, and tests
 

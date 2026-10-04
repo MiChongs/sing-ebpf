@@ -89,40 +89,42 @@ type cgroupRuntime struct {
 }
 
 type CgroupBackend struct {
-	access                 sync.RWMutex
-	health                 backendHealth
-	udpRecoveryAccess      sync.Mutex
-	udpReleaseReadAccess   sync.Mutex
-	udpReplyTokenSequence  atomic.Uint64
-	lookupAndDeleteMode    atomic.Int32
-	udpRecoveryConsumeMode atomic.Int32
-	runtime                *cgroupRuntime
-	mapCapacity            CgroupMapCapacity
-	tcpRedirectMapFD       int
-	udpRedirectMapFD       int
-	udpRecoveryMapFD       int
-	udpFlowMapFD           int
-	socketBypassMapFD      int
-	bypassIPv4CIDRMapFD    int
-	bypassIPv6CIDRMapFD    int
-	hostIPv4MapFD          int
-	hostIPv6MapFD          int
-	bypassIPv4CIDR         []netip.Prefix
-	bypassIPv6CIDR         []netip.Prefix
-	hostIPv4               []netip.Prefix
-	hostIPv6               []netip.Prefix
-	cgroupPath             string
-	redirectIPv4           netip.Prefix
-	redirectIPv6           netip.Prefix
-	forceInterceptIPv4     netip.Prefix
-	forceInterceptIPv6     netip.Prefix
-	enableIPv6             bool
-	enableUDP              bool
-	dnsMode                DNSMode
-	bypassPrivateAddress   bool
-	udpTimeoutSeconds      uint32
-	networkGeneration      uint32
-	listenerPort           uint16
+	access                  sync.RWMutex
+	health                  backendHealth
+	udpRecoveryAccess       sync.Mutex
+	recoverySweepScratch    mapScanScratch[listenerLookupKey, originalDestinationValue]
+	recoverySweepCandidates []udpRecoveryEntry
+	udpReleaseReadAccess    sync.Mutex
+	udpReplyTokenSequence   atomic.Uint64
+	lookupAndDeleteMode     atomic.Int32
+	udpRecoveryConsumeMode  atomic.Int32
+	runtime                 *cgroupRuntime
+	mapCapacity             CgroupMapCapacity
+	tcpRedirectMapFD        int
+	udpRedirectMapFD        int
+	udpRecoveryMapFD        int
+	udpFlowMapFD            int
+	socketBypassMapFD       int
+	bypassIPv4CIDRMapFD     int
+	bypassIPv6CIDRMapFD     int
+	hostIPv4MapFD           int
+	hostIPv6MapFD           int
+	bypassIPv4CIDR          []netip.Prefix
+	bypassIPv6CIDR          []netip.Prefix
+	hostIPv4                []netip.Prefix
+	hostIPv6                []netip.Prefix
+	cgroupPath              string
+	redirectIPv4            netip.Prefix
+	redirectIPv6            netip.Prefix
+	forceInterceptIPv4      netip.Prefix
+	forceInterceptIPv6      netip.Prefix
+	enableIPv6              bool
+	enableUDP               bool
+	dnsMode                 DNSMode
+	bypassPrivateAddress    bool
+	udpTimeoutSeconds       uint32
+	networkGeneration       uint32
+	listenerPort            uint16
 }
 
 func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
@@ -227,7 +229,9 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries), len(policy.localBypassPortEntries), config.SelfBypassMap); err != nil {
 		_ = closeMaps(runtimeState.maps)
 		_ = runtimeState.cgroupFile.Close()
-		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
+		if errors.Is(err, unix.EPERM) {
+			err = explainBPFPermissionError(err, memlockErr)
+		} else if memlockErr != nil && errors.Is(err, unix.ENOMEM) {
 			err = E.Errors(err, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, err

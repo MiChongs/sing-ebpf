@@ -5,6 +5,7 @@ package core
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	CiliumEBPF "github.com/cilium/ebpf"
@@ -99,6 +100,46 @@ func TestRawCgroupAttachPreservesExistingOwner(t *testing.T) {
 	}
 	if !slices.Equal(flags, []uint32{unix.BPF_F_ALLOW_MULTI}) {
 		t.Fatalf("flags=%v, want only the non-destructive multi attach", flags)
+	}
+}
+
+func TestRawCgroupAttachOccupiedErrorNamesOwners(t *testing.T) {
+	originalRawAttachProgram := rawAttachProgram
+	originalQuery := queryCgroupPrograms
+	originalDescribe := describeCgroupProgram
+	t.Cleanup(func() {
+		rawAttachProgram = originalRawAttachProgram
+		queryCgroupPrograms = originalQuery
+		describeCgroupProgram = originalDescribe
+	})
+	rawAttachProgram = func(current link.RawAttachProgramOptions) error {
+		if current.Flags != unix.BPF_F_ALLOW_MULTI {
+			t.Fatalf("occupied hook received destructive attach flags %#x", current.Flags)
+		}
+		return unix.EPERM
+	}
+	queryCgroupPrograms = func(link.QueryOptions) (*link.QueryResult, error) {
+		return &link.QueryResult{Programs: []link.AttachedProgram{{ID: 57}}}, nil
+	}
+	describeCgroupProgram = func(id CiliumEBPF.ProgramID) string {
+		if id != 57 {
+			t.Fatalf("described program %d, want 57", id)
+		}
+		return "id=57 name=foreign_conn4"
+	}
+	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	if !errors.Is(err, ErrCgroupHookOccupied) {
+		t.Fatalf("error = %v, want ErrCgroupHookOccupied", err)
+	}
+	for _, want := range []string{"refusing to replace existing cgroup program owner", "CGroupInet4Connect", "id=57 name=foreign_conn4"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+	// The backend wraps the error; the sentinel must survive that wrapping.
+	wrapped := eBPFBackendOperationError("attach eBPF cgroup programs", kernelProgramNameCgroupConnect4, err)
+	if !errors.Is(wrapped, ErrCgroupHookOccupied) {
+		t.Fatalf("wrapped error lost ErrCgroupHookOccupied: %v", wrapped)
 	}
 }
 

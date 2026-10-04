@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	BPFGen "github.com/MiChongs/sing-ebpf/internal/bpfgen"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -20,6 +21,53 @@ const bpfFlagNoPrealloc = 1
 var rawAttachProgram = link.RawAttachProgram
 
 var queryCgroupPrograms = link.QueryPrograms
+
+// describeCgroupProgram names an attached program for diagnostics. Tests
+// replace it because opening a program by ID requires a live kernel object.
+var describeCgroupProgram = func(id CiliumEBPF.ProgramID) string {
+	program, err := CiliumEBPF.NewProgramFromID(id)
+	if err != nil {
+		return fmt.Sprintf("id=%d", id)
+	}
+	defer program.Close()
+	info, err := program.Info()
+	if err != nil || info.Name == "" {
+		return fmt.Sprintf("id=%d", id)
+	}
+	return fmt.Sprintf("id=%d name=%s", id, info.Name)
+}
+
+// ErrCgroupHookOccupied reports that a cgroup hook already holds a program in
+// single-program (exclusive or override) mode. The kernel rejects every
+// multi-program attachment on such a hook, including BPF_LINK_CREATE, and the
+// only remaining operation would displace that program. sing-ebpf never does
+// that, so callers must choose another data plane or free the hook.
+var ErrCgroupHookOccupied = errors.New("refusing to replace existing cgroup program owner")
+
+type cgroupHookOccupiedError struct {
+	attachType CiliumEBPF.AttachType
+	owners     []string
+}
+
+func (e *cgroupHookOccupiedError) Error() string {
+	message := ErrCgroupHookOccupied.Error() + " on " + e.attachType.String()
+	if len(e.owners) > 0 {
+		message += " (" + strings.Join(e.owners, ", ") + ")"
+	}
+	return message
+}
+
+func (e *cgroupHookOccupiedError) Unwrap() error {
+	return ErrCgroupHookOccupied
+}
+
+func newCgroupHookOccupiedError(attachType CiliumEBPF.AttachType, programs []link.AttachedProgram) error {
+	owners := make([]string, 0, len(programs))
+	for _, program := range programs {
+		owners = append(owners, describeCgroupProgram(program.ID))
+	}
+	return &cgroupHookOccupiedError{attachType: attachType, owners: owners}
+}
 
 var loadTC = BPFGen.LoadTC
 
@@ -36,10 +84,13 @@ func attachProgramRaw(target int, program *CiliumEBPF.Program, attachType Cilium
 	return err
 }
 
-// attachProgramRawMultiOnly is used for optional capability probes. Probes
-// must never fall back to the unflagged legacy operation because that variant
-// replaces an existing exclusive cgroup owner. A denied multi attach simply
-// means that the optional capability is unavailable.
+// attachProgramRawMultiOnly is used for optional capability probes and for
+// optional components that share a cgroup with the required interception
+// backend. Neither may fall back to the unflagged legacy operation: that
+// variant replaces an existing exclusive cgroup owner, and on an empty hook it
+// leaves the hook in single-program mode, which then locks every later
+// multi-program user (including the interception backend) out of it. A denied
+// multi attach simply means that the optional capability is unavailable.
 func attachProgramRawMultiOnly(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
 	return rawAttachProgram(link.RawAttachProgramOptions{
 		Target:  target,
@@ -69,12 +120,15 @@ func attachProgramRawWithMode(target int, program *CiliumEBPF.Program, attachTyp
 		return "", multiErr
 	}
 	// An unflagged legacy attach replaces the current exclusive owner. Do not
-	// displace a vendor/OS cgroup hook that we cannot restore after shutdown;
-	// callers will use their userspace fallback instead. Kernels without
-	// BPF_PROG_QUERY retain the historical fallback because there is no safe
-	// way to distinguish an empty hook from an unqueryable one.
+	// displace a vendor/OS cgroup hook that we cannot restore after shutdown.
+	// Optional components fall back to userspace; the interception backend has
+	// no such fallback and reports ErrCgroupHookOccupied, naming the current
+	// owners so the operator can tell a foreign program from a stale one of
+	// ours. Kernels without BPF_PROG_QUERY retain the historical fallback
+	// because there is no safe way to distinguish an empty hook from an
+	// unqueryable one.
 	if result, queryErr := queryCgroupPrograms(link.QueryOptions{Target: target, Attach: attachType}); queryErr == nil && len(result.Programs) > 0 {
-		return "", E.New("refusing to replace existing cgroup program owner")
+		return "", newCgroupHookOccupiedError(attachType, result.Programs)
 	}
 	// Keep the legacy fallback used before multi-only attachment was adopted.
 	// Some vendor kernels reject ALLOW_MULTI for otherwise usable hooks. An

@@ -54,6 +54,8 @@ type (
 	MapOccupancy                   = core.MapOccupancy
 	MapOccupancyReport             = core.MapOccupancyReport
 	UDPStateDiagnostics            = core.UDPStateDiagnostics
+	UDPReleaseEvent                = core.UDPReleaseEvent
+	UDPRecoverySweepResult         = core.UDPRecoverySweepResult
 )
 
 const (
@@ -110,6 +112,11 @@ const (
 	KernelProbeRequired    = core.KernelProbeRequired
 	KernelProbePerformance = core.KernelProbePerformance
 )
+
+// ErrCgroupHookOccupied is matched with errors.Is when a cgroup attachment is
+// refused because the hook already holds a program in single-program mode.
+// The error text names the programs currently attached to that hook.
+var ErrCgroupHookOccupied = core.ErrCgroupHookOccupied
 
 type SelfBypass struct {
 	core.SelfBypassHandle
