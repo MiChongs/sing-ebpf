@@ -73,9 +73,7 @@ func (d *tcDataPlane) createTCDeliveryLink() (*tcDeliveryLink, error) {
 			delivery.sysctls = appendTCSysctlStates(delivery.sysctls, []tcSysctlState{state})
 		}
 	}
-	aggregateStates, err := clearTCAggregateRPFilter(deliveryName)
-	delivery.globalSysctls = appendTCSysctlStates(delivery.globalSysctls, aggregateStates)
-	if err != nil {
+	if _, err = delivery.claimAggregateRPFilter(); err != nil {
 		return cleanup(err)
 	}
 	if err = ensureTCClsact(delivery.delivery); err != nil {
@@ -102,6 +100,17 @@ func (d *tcDataPlane) createTCDeliveryLink() (*tcDeliveryLink, error) {
 		return cleanup(err)
 	}
 	return delivery, nil
+}
+
+// tcDeliveryInterfaceName reports whether name is a delivery interface name
+// nextTCVethNames hands out.
+func tcDeliveryInterfaceName(name string) bool {
+	suffix, found := strings.CutPrefix(name, "sbd")
+	if !found || len(suffix) != 8 {
+		return false
+	}
+	_, err := strconv.ParseUint(suffix, 16, 32)
+	return err == nil
 }
 
 func nextTCVethNames() (string, string, error) {
@@ -293,7 +302,9 @@ func clearTCAggregateRPFilter(deliveryName string) ([]tcSysctlState, error) {
 		return states, E.Errors(cause, restoreErr)
 	}
 	for _, entry := range entries {
-		if entry.Name() == "all" || entry.Name() == deliveryName {
+		// Every delivery interface needs its own filter off, including those of
+		// other runtimes in the network namespace.
+		if entry.Name() == "all" || entry.Name() == deliveryName || tcDeliveryInterfaceName(entry.Name()) {
 			continue
 		}
 		state, changed, pinErr := pinTCInterfaceRPFilter(entry.Name(), aggregate)
@@ -357,6 +368,10 @@ func pinTCInterfaceRPFilter(interfaceName string, aggregate int) (tcSysctlState,
 // fresh under the new delivery interface's own name, and the old delivery
 // interface is deleted (and its own sysctls restored, harmlessly, right before
 // that) regardless of who replaced it, so there is nothing there to hand off.
+//
+// The lease moves along unless the new link already took its own, which it does
+// when the old link's lease was live while it lowered nothing: the old link then
+// releases its lease on close without restoring, since the new one remains.
 func handoffTCGlobalSysctls(previous, next *tcDeliveryLink) {
 	if previous == nil || next == nil {
 		return
@@ -365,6 +380,9 @@ func handoffTCGlobalSysctls(previous, next *tcDeliveryLink) {
 		next.globalSysctls = previous.globalSysctls
 	}
 	previous.globalSysctls = nil
+	if next.globalLease == nil {
+		next.globalLease, previous.globalLease = previous.globalLease, nil
+	}
 }
 
 func restoreTCSysctlStatesOwned(states *[]tcSysctlState) error {
@@ -379,7 +397,8 @@ func restoreTCSysctlStatesOwned(states *[]tcSysctlState) error {
 }
 
 func (d *tcDeliveryLink) IsClosed() bool {
-	return d == nil || d.filter == nil && d.redirect == nil && d.delivery == nil && len(d.sysctls) == 0 && len(d.globalSysctls) == 0
+	return d == nil || d.filter == nil && d.redirect == nil && d.delivery == nil &&
+		len(d.sysctls) == 0 && len(d.globalSysctls) == 0 && d.globalLease == nil
 }
 
 func (d *tcDeliveryLink) Close() error {
@@ -392,7 +411,7 @@ func (d *tcDeliveryLink) Close() error {
 	if err := restoreTCSysctlStatesOwned(&d.sysctls); err != nil {
 		return err
 	}
-	if err := restoreTCSysctlStatesOwned(&d.globalSysctls); err != nil {
+	if err := d.releaseAggregateRPFilter(); err != nil {
 		return err
 	}
 	owned := d.redirect

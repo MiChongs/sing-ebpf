@@ -35,13 +35,11 @@ func TestTCPolicyRoutingIntegration(t *testing.T) {
 	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
 		// routing.{table,mark,priority} are what allocateTCPolicyIdentifiers
 		// actually picked for this run, not necessarily the preferred
-		// defaults (tcPolicyRoutingTable/commonEBPF.DefaultTCRoutingMark):
-		// the mark allocator in particular starts from its own highest bit
-		// (30) and only reaches DefaultTCRoutingMark's bit (29) if 30 is
-		// already taken by something else, which on a clean host it never
-		// is. Asserting against the fixed defaults instead of the values
-		// startTCPolicyRouting actually returned is what let this test pass
-		// while checking properties of a rule that was never installed.
+		// identifiers of its slot: those are skipped whenever anything else
+		// on the host already uses one of them. Asserting against fixed
+		// defaults instead of the values startTCPolicyRouting actually
+		// returned is what once let this test pass while checking
+		// properties of a rule that was never installed.
 		expectedRoutes := tcPolicyRoutesForTable(loopback.Attrs().Index, family, routing.table)
 		routes, listErr := netlink.RouteListFiltered(
 			family,

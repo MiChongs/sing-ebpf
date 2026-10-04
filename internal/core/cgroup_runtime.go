@@ -99,6 +99,21 @@ func cgroupUDPUserspaceCleanupModeLocked(runtimeState *cgroupRuntime) string {
 	return cgroupUDPUserspaceCleanupDeadline
 }
 
+// InstanceSlot is the cgroup instance slot of this backend. Several
+// interception backends can share a cgroup; slot 0 is the one single-instance
+// builds used, and every other slot suffixes the kernel program names.
+func (b *CgroupBackend) InstanceSlot() int {
+	if b == nil {
+		return 0
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return 0
+	}
+	return b.runtime.slot.Index()
+}
+
 func (b *CgroupBackend) CgroupPath() string {
 	if b == nil {
 		return ""

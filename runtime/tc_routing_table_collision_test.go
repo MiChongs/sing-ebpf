@@ -37,7 +37,7 @@ func TestAllocateTCPolicyIdentifiersAvoidsARouteOnlyTable(t *testing.T) {
 		t.Fatalf("occupy the default candidate table with a plain route: %v", err)
 	}
 
-	identifiers, err := allocateTCPolicyIdentifiers(loopback.Attrs().Index, []int{unix.AF_INET})
+	identifiers, err := allocateTCPolicyIdentifiers(loopback.Attrs().Index, []int{unix.AF_INET}, 0)
 	if err != nil {
 		t.Fatalf("allocate TC policy identifiers: %v", err)
 	}

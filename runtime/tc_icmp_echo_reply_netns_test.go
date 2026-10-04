@@ -176,7 +176,8 @@ func TestICMPEchoLocalReplyAnswersARealPing(t *testing.T) {
 	const forceInterceptTarget = "198.18.0.1"
 	self := setupICMPEchoReplyPingVeth(t, "sbicmpr0", "sbicmpr1", forceInterceptTarget)
 
-	const priority = 2 // force clsact; see TestAttachTCInterfaceAddsTheICMPEchoReplyFilterWhenEnabled.
+	forceTCClsact(t) // see TestAttachTCInterfaceAddsTheICMPEchoReplyFilterWhenEnabled.
+	const priority = 2
 	lock, err := acquireTCInterfaceLock("sbicmpr0", self.Attrs().Index)
 	if err != nil {
 		t.Fatalf("acquire the interface lock: %v", err)

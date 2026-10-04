@@ -258,6 +258,8 @@ INLINE bool token_v6(
         __builtin_memcpy(key->token_addr, config->redirect_ipv6_prefix, 8U);
         __builtin_memcpy(key->token_addr + 8U, &seed0, 4U);
         __builtin_memcpy(key->token_addr + 12U, &seed1, 4U);
+        key->token_addr[8] = SB_EBPF_IPV6_TOKEN_MARKER0;
+        key->token_addr[9] = SB_EBPF_IPV6_TOKEN_MARKER1;
         if (protocol == TCP_VALUE) {
             struct sb_ebpf_original_dst *existing = map_lookup(&cgroup_tcp_redirect, key);
             if (existing != 0 && equal_original(existing, value)) return true;
@@ -684,6 +686,8 @@ INLINE int handle_v6(
     if (!connect_hook) (void)restore_udp_peer_v6(cookie, address, &port);
     if (service_port(protocol, port)) return 1;
     if (sb_ebpf_ipv6_safety_bypass((const __u8 *)address)) return 1;
+    // Another backend sharing this socket's cgroup hooks already redirected it.
+    if (sb_ebpf_ipv6_redirect_token((const __u8 *)address)) return 1;
     bool force_intercept = sb_ebpf_force_intercept_ipv6(
         (const __u8 *)address,
         config->flags,

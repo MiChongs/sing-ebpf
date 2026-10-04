@@ -8,12 +8,11 @@ import (
 	"net/netip"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
+	core "github.com/MiChongs/sing-ebpf/internal/core"
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/sagernet/netlink"
@@ -26,15 +25,79 @@ const (
 	sharedRewriteICMPFilterHandle    = 0x5349
 )
 
-var sharedRewriteAttachmentSequence atomic.Uint32
-
+// sharedRewriteAttachmentOptions selects the identity of a new attachment. A
+// replacement on the same interface index shares the slot of the attachment
+// it replaces and takes a filter generation no attachment of that slot still
+// uses, so both sets of filters can be attached while the replacement is made
+// before the previous one is broken. Without a lock, the attachment takes a
+// slot of its own.
 type sharedRewriteAttachmentOptions struct {
-	skipLock  bool
-	temporary bool
+	lock       *sharedTCInterfaceLock
+	generation int
 }
 
-func temporarySharedRewriteAttachmentOptions() sharedRewriteAttachmentOptions {
-	return sharedRewriteAttachmentOptions{temporary: true}
+// sharedTCInterfaceLock is an interface slot that several attachments hold at
+// once: a make-before-break replacement holds it together with the attachment
+// it replaces, and a replaced attachment that could not detach keeps holding
+// it. The slot is released when the last holder closes, so no other runtime
+// can take the slot while filters remain under its names.
+type sharedTCInterfaceLock struct {
+	holders *sharedTCInterfaceLockHolders
+}
+
+type sharedTCInterfaceLockHolders struct {
+	slot  *core.InstanceSlot
+	count int
+}
+
+func newSharedTCInterfaceLock(slot *core.InstanceSlot) *sharedTCInterfaceLock {
+	return &sharedTCInterfaceLock{holders: &sharedTCInterfaceLockHolders{slot: slot, count: 1}}
+}
+
+// share returns another holder of the same slot.
+func (l *sharedTCInterfaceLock) share() *sharedTCInterfaceLock {
+	l.holders.count++
+	return &sharedTCInterfaceLock{holders: l.holders}
+}
+
+func (l *sharedTCInterfaceLock) Index() int {
+	if l == nil || l.holders == nil {
+		return 0
+	}
+	return l.holders.slot.Index()
+}
+
+func (l *sharedTCInterfaceLock) Close() error {
+	if l == nil || l.holders == nil {
+		return nil
+	}
+	if l.holders.count == 1 {
+		if err := l.holders.slot.Close(); err != nil {
+			return err
+		}
+	}
+	l.holders.count--
+	l.holders = nil
+	return nil
+}
+
+// replacementGenerationLocked picks the filter generation of a replacement for
+// previous: one that neither previous nor any retained attachment of the same
+// interface slot still uses.
+func (d *sharedRewriteDataPlane) replacementGenerationLocked(previous *sharedRewriteAttachment) (int, error) {
+	used := make([]bool, tcFilterGenerations)
+	used[previous.generation] = true
+	for _, retired := range d.retiredAttachments {
+		if retired.interfaceIndex == previous.interfaceIndex && retired.slot == previous.slot && !retired.IsClosed() {
+			used[retired.generation] = true
+		}
+	}
+	for generation, inUse := range used {
+		if !inUse {
+			return generation, nil
+		}
+	}
+	return 0, E.New("every filter generation of interface ", previous.interfaceName, " is held by an attachment that could not detach")
 }
 
 type sharedRewriteDataPlane struct {
@@ -118,21 +181,26 @@ func (e sharedRewriteCallbackEvents) dispatch(hooks SharedPacketRewriteHooks) {
 }
 
 type sharedRewriteAttachment struct {
-	interfaceName   string
-	interfaceIndex  int
-	lock            io.Closer
-	ingressFilter   *netlink.BpfFilter
-	egressFilter    *netlink.BpfFilter
-	ingressName     string
-	egressName      string
-	icmpName        string
-	ingressHandle   uint16
-	egressHandle    uint16
-	icmpHandle      uint16
-	ingressLink     link.Link
-	egressLink      link.Link
-	restoreLocalnet bool
-	attachmentType  string
+	interfaceName  string
+	interfaceIndex int
+	slot           int
+	generation     int
+	// lock is a *sharedTCInterfaceLock in production.
+	lock          io.Closer
+	ingressFilter *netlink.BpfFilter
+	egressFilter  *netlink.BpfFilter
+	ingressName   string
+	egressName    string
+	icmpName      string
+	ingressHandle uint16
+	egressHandle  uint16
+	icmpHandle    uint16
+	ingressLink   link.Link
+	egressLink    link.Link
+	// localnet is this attachment's lease on the interface's route_localnet,
+	// which other runtimes on the same interface may share.
+	localnet       *core.InstanceLease
+	attachmentType string
 	// icmpFilter/icmpLink are the icmp_echo_reply shared-reply filter, attached
 	// alongside ingressFilter/ingressLink (same interface, same direction)
 	// only when backend.ICMPEchoReplyEnabled(); nil whenever that feature is
@@ -264,12 +332,8 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 		device := desired[name]
 		previous := current[name]
 		if previous != nil && device.Attrs().Index == previous.interfaceIndex {
-			localnetChanged, err := ensureSharedRewriteLocalnet(name)
-			if err != nil {
+			if err := claimSharedRewriteLocalnet(name, &previous.localnet); err != nil {
 				return cleanupCandidates(E.Cause(err, "repair route_localnet for ", name))
-			}
-			if localnetChanged {
-				previous.restoreLocalnet = true
 			}
 			healthy, err := previous.healthy(device, d.priority, backend.ICMPEchoReplyEnabled())
 			if err != nil {
@@ -286,10 +350,13 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 		}
 		options := sharedRewriteAttachmentOptions{}
 		if previous != nil && device.Attrs().Index == previous.interfaceIndex {
-			options = temporarySharedRewriteAttachmentOptions()
-			options.skipLock = true
-		} else if previous != nil {
-			options = temporarySharedRewriteAttachmentOptions()
+			if lock, shared := previous.lock.(*sharedTCInterfaceLock); shared && lock.holders != nil {
+				generation, err := d.replacementGenerationLocked(previous)
+				if err != nil {
+					return cleanupCandidates(E.Cause(err, "replace shared packet-rewrite interface ", name))
+				}
+				options = sharedRewriteAttachmentOptions{lock: lock, generation: generation}
+			}
 		}
 		attachment, err := attachSharedRewriteInterfaceWithOptions(device, backend, d.priority, options)
 		if err != nil {
@@ -322,26 +389,20 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 	for _, previous := range retired {
 		replacement := candidate[previous.interfaceName]
 		if replacement != nil && replacement.interfaceIndex == previous.interfaceIndex {
-			lock := previous.lock
-			previous.lock = nil
-			if previous.restoreLocalnet {
-				replacement.restoreLocalnet = true
-				previous.restoreLocalnet = false
+			if replacement.localnet == nil {
+				replacement.localnet, previous.localnet = previous.localnet, nil
 			}
+			// Each holds the slot, so a previous attachment that cannot detach
+			// keeps it, and with it the names its filters still carry.
 			if err := d.detachLocked(previous, &callbackEvents); err != nil {
 				// The candidate is already active. Keep it as the committed state
 				// and report the old attachment cleanup failure to the caller.
 				closeErr = E.Errors(closeErr, E.Cause(err, "detach shared packet-rewrite interface ", previous.interfaceName))
 				changed = true
-				if replacement.lock == nil {
-					replacement.lock = lock
-				}
 				if !previous.IsClosed() {
 					d.retainRetiredAttachment(previous)
 				}
-				continue
 			}
-			replacement.lock = lock
 		} else {
 			if err := d.detachLocked(previous, &callbackEvents); err != nil {
 				// Continue committing the candidate topology so a stale attachment
@@ -483,6 +544,7 @@ func (d *sharedRewriteDataPlane) attachmentDiagnostics() []commonEBPF.Attachment
 			Framing:        "ethernet",
 			Mechanism:      attachment.attachmentType,
 			ICMPEchoReply:  attachment.icmpFilter != nil || attachment.icmpLink != nil,
+			Slot:           attachment.slot,
 		})
 	}
 	slices.SortFunc(diagnostics, func(a, b commonEBPF.AttachmentInfo) int {
@@ -568,55 +630,51 @@ func attachSharedRewriteInterfaceWithOptions(
 	cleanup := func(err error) (*sharedRewriteAttachment, error) {
 		return nil, E.Errors(err, attachment.Close())
 	}
-	if !options.skipLock {
-		interfaceLock, err := acquireTCInterfaceLock(name, device.Attrs().Index)
+	var lock *sharedTCInterfaceLock
+	if options.lock != nil {
+		lock = options.lock.share()
+		attachment.generation = options.generation
+	} else {
+		slot, err := acquireTCInterfaceLock(name, device.Attrs().Index)
 		if err != nil {
 			return nil, err
 		}
-		attachment.lock = interfaceLock
+		lock = newSharedTCInterfaceLock(slot)
 	}
-	attachment.ingressName = "sb_share_in"
-	attachment.egressName = "sb_share_out"
-	attachment.icmpName = "sb_icmp_share"
-	attachment.ingressHandle = sharedRewriteIngressFilterHandle
-	attachment.egressHandle = sharedRewriteEgressFilterHandle
-	attachment.icmpHandle = sharedRewriteICMPFilterHandle
-	if options.temporary {
-		sequence := sharedRewriteAttachmentSequence.Add(1) & 0x0fff
-		if sequence == 0 {
-			sequence = 1
-		}
-		suffix := strconv.FormatUint(uint64(sequence), 16)
-		attachment.ingressName = "sbi" + suffix
-		attachment.egressName = "sbo" + suffix
-		attachment.icmpName = "sbc" + suffix
-		attachment.ingressHandle += uint16(sequence)
-		attachment.egressHandle += uint16(sequence)
-		attachment.icmpHandle += uint16(sequence)
-	}
-	attachment.restoreLocalnet, err = enableSharedRewriteLocalnet(name)
-	if err != nil {
+	attachment.lock = lock
+	attachment.slot = lock.Index()
+	ingress := tcSlotFilter(attachment.slot, attachment.generation, tcFilterRoleRewriteIngress)
+	egress := tcSlotFilter(attachment.slot, attachment.generation, tcFilterRoleRewriteEgress)
+	icmp := tcSlotFilter(attachment.slot, attachment.generation, tcFilterRoleRewriteICMP)
+	attachment.ingressName, attachment.ingressHandle = ingress.name, ingress.handle
+	attachment.egressName, attachment.egressHandle = egress.name, egress.handle
+	attachment.icmpName, attachment.icmpHandle = icmp.name, icmp.handle
+	if err = claimSharedRewriteLocalnet(name, &attachment.localnet); err != nil {
 		return cleanup(err)
 	}
-	if priority == defaultTCPriority && tcxSupport.Load() != tcxSupportUnavailable {
-		attachment.egressLink, err = link.AttachTCX(link.TCXOptions{
-			Interface: device.Attrs().Index,
-			Program:   rawSharedPacketRewriteBackend(backend).EgressProgram(),
-			Attach:    CiliumEBPF.AttachTCXEgress,
-		})
+	// TCX keeps the priority contract through the ordered attach.
+	if tcxSupport.Load() != tcxSupportUnavailable {
+		attachment.egressLink, err = coreAttachTCXOrdered(
+			device.Attrs().Index,
+			CiliumEBPF.AttachTCXEgress,
+			rawSharedPacketRewriteBackend(backend).EgressProgram(),
+			priority,
+		)
 		if err == nil {
-			attachment.ingressLink, err = link.AttachTCX(link.TCXOptions{
-				Interface: device.Attrs().Index,
-				Program:   rawSharedPacketRewriteBackend(backend).IngressProgram(),
-				Attach:    CiliumEBPF.AttachTCXIngress,
-			})
+			attachment.ingressLink, err = coreAttachTCXOrdered(
+				device.Attrs().Index,
+				CiliumEBPF.AttachTCXIngress,
+				rawSharedPacketRewriteBackend(backend).IngressProgram(),
+				priority,
+			)
 		}
 		if err == nil && backend.ICMPEchoReplyEnabled() {
-			attachment.icmpLink, err = link.AttachTCX(link.TCXOptions{
-				Interface: device.Attrs().Index,
-				Program:   rawSharedPacketRewriteBackend(backend).ICMPEchoSharedReplyProgram(commonEBPF.TCLinkFramingEthernet),
-				Attach:    CiliumEBPF.AttachTCXIngress,
-			})
+			attachment.icmpLink, err = coreAttachTCXOrdered(
+				device.Attrs().Index,
+				CiliumEBPF.AttachTCXIngress,
+				rawSharedPacketRewriteBackend(backend).ICMPEchoSharedReplyProgram(commonEBPF.TCLinkFramingEthernet),
+				priority,
+			)
 		}
 		if err == nil {
 			tcxSupport.Store(tcxSupportAvailable)
@@ -624,10 +682,13 @@ func attachSharedRewriteInterfaceWithOptions(
 			return attachment, nil
 		}
 		_ = attachment.closeLinks()
-		if !tcxUnsupportedError(err) {
+		// Without a known TCX order, clsact still honors the priority.
+		if !tcxUnsupportedError(err) && !errors.Is(err, core.ErrTCXOrderUnavailable) {
 			return cleanup(err)
 		}
-		tcxSupport.CompareAndSwap(tcxSupportUnknown, tcxSupportUnavailable)
+		if tcxUnsupportedError(err) {
+			tcxSupport.CompareAndSwap(tcxSupportUnknown, tcxSupportUnavailable)
+		}
 	}
 	if err = ensureTCClsact(device); err != nil {
 		return cleanup(err)
@@ -697,7 +758,7 @@ func (a *sharedRewriteAttachment) closeLinks() error {
 func (a *sharedRewriteAttachment) IsClosed() bool {
 	return a == nil || a.ingressFilter == nil && a.egressFilter == nil && a.icmpFilter == nil &&
 		a.ingressLink == nil && a.egressLink == nil && a.icmpLink == nil &&
-		!a.restoreLocalnet && a.lock == nil
+		a.localnet == nil && a.lock == nil
 }
 
 func (a *sharedRewriteAttachment) Close() error {
@@ -717,11 +778,8 @@ func (a *sharedRewriteAttachment) Close() error {
 		a.ingressLink != nil || a.egressLink != nil || a.icmpLink != nil {
 		return closeErr
 	}
-	if a.restoreLocalnet {
-		if err := restoreSharedRewriteLocalnet(a.interfaceName); err != nil {
-			return E.Errors(closeErr, err)
-		}
-		a.restoreLocalnet = false
+	if err := releaseSharedRewriteLocalnet(a.interfaceName, &a.localnet); err != nil {
+		return E.Errors(closeErr, err)
 	}
 	if a.lock != nil {
 		closeErr = E.Errors(closeErr, closeOwned(&a.lock))

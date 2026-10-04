@@ -100,7 +100,7 @@ func TestTCXAttachmentOutcome(t *testing.T) {
 
 // TestICMPEchoLocalReplyAnswersARealPingViaTCX is
 // TestICMPEchoLocalReplyAnswersARealPing over the attachment mechanism
-// production actually defaults to. The clsact test forces priority=2
+// production actually defaults to. The clsact test calls forceTCClsact
 // specifically so it cannot silently exercise this path instead; this test
 // exists so TCX itself is not left completely unverified against a real
 // packet. Skips (does not fail) on a kernel without TCX support.

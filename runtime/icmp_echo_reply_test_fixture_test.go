@@ -118,7 +118,7 @@ func attachICMPEchoReplyOrSkip(
 	if err != nil {
 		t.Fatalf("attach the interface: %v", err)
 	}
-	if priority == defaultTCPriority && attachment.attachmentType != "tcx" {
+	if !tcClsactForced && attachment.attachmentType != "tcx" {
 		_ = attachment.Close()
 		requireOrSkipTCX(t, attachment.attachmentType)
 	}
@@ -136,7 +136,7 @@ func attachSharedRewriteOrSkip(
 	if err != nil {
 		t.Fatalf("attach the shared packet-rewrite interface: %v", err)
 	}
-	if priority == defaultTCPriority && attachment.attachmentType != "tcx" {
+	if !tcClsactForced && attachment.attachmentType != "tcx" {
 		_ = attachment.Close()
 		requireOrSkipTCX(t, attachment.attachmentType)
 	}
@@ -174,6 +174,7 @@ const (
 type forceInterceptSharedReplyCase struct {
 	dataPlane  forceInterceptSharedDataPlane
 	ipv6       bool
+	clsact     bool
 	priority   uint16
 	selfName   string
 	peerName   string
@@ -185,6 +186,9 @@ type forceInterceptSharedReplyCase struct {
 func runForceInterceptSharedReplyCase(t *testing.T, testCase forceInterceptSharedReplyCase) {
 	t.Helper()
 	enterTestNetworkNamespace(t)
+	if testCase.clsact {
+		forceTCClsact(t)
+	}
 	self, peer := createTestVethPair(t, testCase.selfName, testCase.peerName)
 
 	var counter icmpEchoReplyCounter
@@ -197,10 +201,10 @@ func runForceInterceptSharedReplyCase(t *testing.T, testCase forceInterceptShare
 			t, backend, testCase.selfName, self.Attrs().Index, tcInterfaceRole{shared: true}, testCase.priority,
 		)
 		t.Cleanup(func() { _ = attachment.Close() })
-		if testCase.priority == defaultTCPriority && attachment.sharedICMPLink == nil {
+		if !testCase.clsact && attachment.sharedICMPLink == nil {
 			t.Fatal("the ForceIntercept ICMP TCX link was not attached")
 		}
-		if testCase.priority != defaultTCPriority && attachment.sharedICMPFilter == nil {
+		if testCase.clsact && attachment.sharedICMPFilter == nil {
 			t.Fatal("the ForceIntercept ICMP clsact filter was not attached")
 		}
 	case forceInterceptSharedPacketRewrite:
@@ -209,10 +213,10 @@ func runForceInterceptSharedReplyCase(t *testing.T, testCase forceInterceptShare
 		counter = backend
 		attachment := attachSharedRewriteOrSkip(t, self, backend, testCase.priority)
 		t.Cleanup(func() { _ = attachment.Close() })
-		if testCase.priority == defaultTCPriority && attachment.icmpLink == nil {
+		if !testCase.clsact && attachment.icmpLink == nil {
 			t.Fatal("the ForceIntercept ICMP TCX link was not attached")
 		}
-		if testCase.priority != defaultTCPriority && attachment.icmpFilter == nil {
+		if testCase.clsact && attachment.icmpFilter == nil {
 			t.Fatal("the ForceIntercept ICMP clsact filter was not attached")
 		}
 	default:

@@ -5,10 +5,12 @@ package runtime
 import (
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
+	core "github.com/MiChongs/sing-ebpf/internal/core"
 	"github.com/sagernet/netlink"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -17,41 +19,84 @@ import (
 // the range a running inbound would pick.
 const testTCInterfaceLockIndex = 0x7f00
 
-// tcLockHeld reports whether the lock for an interface index is currently taken.
+// tcLockHeld reports whether slot 0 of an interface index is currently held.
+// Every attachment in these tests uses an index of its own and takes slot 0.
 func tcLockHeld(t *testing.T, index int) bool {
 	t.Helper()
-	lock, err := acquireTCInterfaceLock("probe", index)
+	probe, err := net.ListenUnixgram("unixgram", &net.UnixAddr{
+		Name: core.InstanceSlotName("@sing-ebpf-tc-"+strconv.Itoa(index), 0),
+		Net:  "unixgram",
+	})
 	if err != nil {
 		return true
 	}
-	if err = lock.Close(); err != nil {
+	if err = probe.Close(); err != nil {
 		t.Fatalf("release the probe lock: %v", err)
 	}
 	return false
 }
 
-// TestTCInterfaceLockIsPerIndex states the property the reconcile ordering has
-// to respect: the lock is named after the interface index alone, so two
-// attachments that happen to share an index cannot hold it at the same time,
-// whatever their names are.
-func TestTCInterfaceLockIsPerIndex(t *testing.T) {
-	held, err := acquireTCInterfaceLock("old", testTCInterfaceLockIndex)
+// tcClsactForced is set while a test runs under forceTCClsact, so attach
+// helpers do not mistake the forced fallback for a kernel without TCX.
+var tcClsactForced bool
+
+// forceTCClsact makes this test attach through the clsact fallback, which a
+// kernel with TCX never selects on its own.
+func forceTCClsact(t *testing.T) {
+	t.Helper()
+	previous := tcxSupport.Swap(tcxSupportUnavailable)
+	tcClsactForced = true
+	t.Cleanup(func() {
+		tcxSupport.Store(previous)
+		tcClsactForced = false
+	})
+}
+
+// TestTCInterfaceLockSlotsArePerIndex states the properties the attachments
+// rely on: every runtime on an interface index holds a slot of its own, the
+// slot is released with its holder and taken by the next runtime, and slots
+// are not shared with any other index.
+func TestTCInterfaceLockSlotsArePerIndex(t *testing.T) {
+	held := make([]*core.InstanceSlot, 0, core.MaxInstanceSlots)
+	t.Cleanup(func() {
+		for _, slot := range held {
+			_ = slot.Close()
+		}
+	})
+	for want := range core.MaxInstanceSlots {
+		slot, err := acquireTCInterfaceLock("runtime", testTCInterfaceLockIndex)
+		if err != nil {
+			t.Fatalf("acquire slot %d: %v", want, err)
+		}
+		if slot.Index() != want {
+			t.Fatalf("acquired slot %d, want %d", slot.Index(), want)
+		}
+		held = append(held, slot)
+	}
+	if _, err := acquireTCInterfaceLock("one-too-many", testTCInterfaceLockIndex); err == nil {
+		t.Fatal("acquired a slot beyond the per-interface limit")
+	}
+	other, err := acquireTCInterfaceLock("other", testTCInterfaceLockIndex+0x40)
 	if err != nil {
-		t.Fatalf("acquire the first lock: %v", err)
+		t.Fatalf("another index shares the slots of the full one: %v", err)
 	}
-	if _, err = acquireTCInterfaceLock("new", testTCInterfaceLockIndex); err == nil {
-		t.Fatal("a second interface took the lock for an index that was already held")
+	if other.Index() != 0 {
+		t.Fatalf("another index started at slot %d, want 0", other.Index())
 	}
-	if err = held.Close(); err != nil {
-		t.Fatalf("release the first lock: %v", err)
+	if err = other.Close(); err != nil {
+		t.Fatalf("release the other index: %v", err)
 	}
-	second, err := acquireTCInterfaceLock("new", testTCInterfaceLockIndex)
+	if err = held[3].Close(); err != nil {
+		t.Fatalf("release slot 3: %v", err)
+	}
+	reused, err := acquireTCInterfaceLock("next", testTCInterfaceLockIndex)
 	if err != nil {
-		t.Fatalf("the lock was not released with the attachment that held it: %v", err)
+		t.Fatalf("the released slot was not available again: %v", err)
 	}
-	if err = second.Close(); err != nil {
-		t.Fatalf("release the second lock: %v", err)
+	if reused.Index() != 3 {
+		t.Fatalf("the next runtime took slot %d, want the released slot 3", reused.Index())
 	}
+	held[3] = reused
 }
 
 // newTestTCAttachment builds an attachment that owns a real interface lock and

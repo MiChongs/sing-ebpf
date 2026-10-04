@@ -27,6 +27,9 @@ func (b *CgroupBackend) Close() error {
 	if b.runtime.cgroupFile != nil {
 		closeErr = E.Errors(closeErr, b.runtime.cgroupFile.Close())
 	}
+	// The slot outlives the cgroup lock: whoever takes it next may reclaim
+	// what is left under its names.
+	closeErr = E.Errors(closeErr, b.runtime.slot.Close())
 	b.runtime = nil
 	b.tcpRedirectMapFD = -1
 	b.udpRedirectMapFD = -1
