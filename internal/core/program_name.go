@@ -10,6 +10,9 @@ const (
 	// Every interception backend program name starts with this prefix. Startup
 	// cleanup relies on it to recognize stale legacy attachments.
 	kernelProgramPrefixCgroup = "sb_ebpf_"
+	// Interception programs of older releases used this prefix. Startup
+	// cleanup still recognizes their stale legacy attachments.
+	kernelProgramPrefixLegacyCgroup = "sing_ebpf_"
 	// Every process tracker program name starts with this prefix.
 	kernelProgramPrefixProcessTracker = "sb_proc_"
 

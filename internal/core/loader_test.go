@@ -81,9 +81,11 @@ func TestRawCgroupAttachFallsBackToExclusiveAfterMultiCompatibilityError(t *test
 func TestRawCgroupAttachPreservesExistingOwner(t *testing.T) {
 	originalRawAttachProgram := rawAttachProgram
 	originalQuery := queryCgroupPrograms
+	originalDescribe := describeCgroupProgram
 	t.Cleanup(func() {
 		rawAttachProgram = originalRawAttachProgram
 		queryCgroupPrograms = originalQuery
+		describeCgroupProgram = originalDescribe
 	})
 	var flags []uint32
 	rawAttachProgram = func(current link.RawAttachProgramOptions) error {
@@ -96,8 +98,13 @@ func TestRawCgroupAttachPreservesExistingOwner(t *testing.T) {
 	queryCgroupPrograms = func(link.QueryOptions) (*link.QueryResult, error) {
 		return &link.QueryResult{Programs: []link.AttachedProgram{{ID: 1}}}, nil
 	}
-	if _, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err == nil {
+	describeCgroupProgram = func(CiliumEBPF.ProgramID) string { return "id=1 name=netd_conn4" }
+	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	if err == nil {
 		t.Fatal("existing cgroup owner was replaced")
+	}
+	if !strings.Contains(err.Error(), "netd_conn4") {
+		t.Fatalf("error = %v, want existing owner name", err)
 	}
 	if !slices.Equal(flags, []uint32{unix.BPF_F_ALLOW_MULTI}) {
 		t.Fatalf("flags=%v, want only the non-destructive multi attach", flags)
@@ -188,6 +195,24 @@ func TestRawCgroupAttachDoesNotFallbackOnFatalError(t *testing.T) {
 	}
 	if callCount != 1 {
 		t.Fatalf("raw attach called %d times, want no exclusive fallback", callCount)
+	}
+}
+
+func TestOwnedCgroupProgramNameIncludesLegacyPrefix(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		want bool
+	}{
+		{name: "sb_ebpf_conn4", want: true},
+		{name: "sing_ebpf_conn4", want: true},
+		{name: "cilium_conn4", want: false},
+		{name: "", want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := ownedCgroupProgramName(testCase.name); got != testCase.want {
+				t.Fatalf("ownedCgroupProgramName(%q)=%v, want %v", testCase.name, got, testCase.want)
+			}
+		})
 	}
 }
 
