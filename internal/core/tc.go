@@ -27,7 +27,7 @@ const (
 
 const (
 	tcAssignmentCapacity        = 65536
-	CompactTCAssignmentCapacity = 8192
+	CompactTCAssignmentCapacity = 16384
 	tcPortPolicyCapacity        = 4096
 )
 

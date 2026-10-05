@@ -321,8 +321,12 @@ func cgroupKernelProgramName(base string, slot int) string {
 }
 
 // cgroupProgramSlot returns the slot an interception program name belongs to,
-// or -1 for any other name.
+// or -1 for any other name. The sing_ebpf_ programs of older releases come
+// from single-instance builds, whose leftovers are slot 0's.
 func cgroupProgramSlot(name string) int {
+	if strings.HasPrefix(name, kernelProgramPrefixLegacyCgroup) {
+		return 0
+	}
 	for _, definition := range cgroupProgramDefinitions {
 		if name == definition.kernelProgramName {
 			return 0
@@ -385,7 +389,7 @@ var queryCgroupHookFlags = func(cgroupFD int, attachType CiliumEBPF.AttachType) 
 // attachment on the hook. A tracker attached by a live process in multi mode,
 // including one this process started before the backend, is left alone.
 func reclaimableCgroupProgram(name string, slot int, hookFlags uint32, programCount int) bool {
-	if strings.HasPrefix(name, kernelProgramPrefixCgroup) {
+	if ownedCgroupProgramName(name) {
 		return slot == cgroupReclaimAllSlots || slot >= 0 && cgroupProgramSlot(name) == slot
 	}
 	return strings.HasPrefix(name, kernelProgramPrefixProcessTracker) &&
@@ -464,8 +468,15 @@ func detachOwnedCgroupPrograms(cgroupFD int, slot int) error {
 	return nil
 }
 
+// ownedCgroupProgramName reports whether name is an interception program of
+// any sing-ebpf generation. Older releases used the sing_ebpf_ prefix, the
+// current names use sb_ebpf_. Unknown owners, such as netd's, never match.
+func ownedCgroupProgramName(name string) bool {
+	return strings.HasPrefix(name, kernelProgramPrefixCgroup) || strings.HasPrefix(name, kernelProgramPrefixLegacyCgroup)
+}
+
 func queryCgroupProgramIDs(cgroupFD int, attachType CiliumEBPF.AttachType) ([]CiliumEBPF.ProgramID, error) {
-	result, err := link.QueryPrograms(link.QueryOptions{Target: cgroupFD, Attach: attachType})
+	result, err := queryCgroupPrograms(link.QueryOptions{Target: cgroupFD, Attach: attachType})
 	if err != nil {
 		return nil, err
 	}
