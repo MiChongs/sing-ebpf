@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unsafe"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -345,5 +346,23 @@ func TestHookPlaceholderIsNotReclaimed(t *testing.T) {
 		if reclaimableCgroupProgram(kernelProgramNameHookPlaceholder, slot, 0, 1) {
 			t.Fatalf("slot %d: the netd placeholder would be reclaimed as stale state", slot)
 		}
+	}
+}
+
+// Linux 6.17 and 6.18 write query.revision back to offset 56 whatever
+// attribute size is passed, so the query attribute must reach past it.
+func TestCgroupProgQueryAttrCoversKernelOutputs(t *testing.T) {
+	var attr cgroupProgQueryAttr
+	if offset := unsafe.Offsetof(attr.attachFlags); offset != 12 {
+		t.Fatalf("query.attach_flags at offset %d, want 12", offset)
+	}
+	if offset := unsafe.Offsetof(attr.programs); offset != 24 {
+		t.Fatalf("query.prog_cnt at offset %d, want 24", offset)
+	}
+	if offset := unsafe.Offsetof(attr.revision); offset != 56 {
+		t.Fatalf("query.revision at offset %d, want 56", offset)
+	}
+	if size := unsafe.Sizeof(attr); size < 64 {
+		t.Fatalf("query attribute is %d bytes, want at least 64 so the kernel's revision write stays inside it", size)
 	}
 }
