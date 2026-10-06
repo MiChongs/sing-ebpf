@@ -126,31 +126,7 @@ func testTCLocalSocketAssignment(t *testing.T, mptcp bool) {
 	setLoopbackUp(t)
 	backend := newSocketAssignTestBackend(t, true)
 	listener := listenTransparentTCP(t, backend, mptcp)
-
-	// The default interface has a gateway that answers no ARP; a permanent
-	// neighbour entry lets the connection's packets reach TC egress.
-	uplink, gateway := createTestVethPair(t, "sbsatcp2", "sbsatcp3")
-	addTestAddress(t, uplink, "10.252.0.1/24")
-	if err := netlink.NeighAdd(&netlink.Neigh{
-		LinkIndex:    uplink.Attrs().Index,
-		Family:       unix.AF_INET,
-		State:        netlink.NUD_PERMANENT,
-		IP:           net.ParseIP("10.252.0.2"),
-		HardwareAddr: gateway.Attrs().HardwareAddr,
-	}); err != nil {
-		t.Fatalf("add the gateway neighbour: %v", err)
-	}
-	_, destinationNetwork, err := net.ParseCIDR("203.0.113.0/24")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = netlink.RouteAdd(&netlink.Route{
-		LinkIndex: uplink.Attrs().Index,
-		Dst:       destinationNetwork,
-		Gw:        net.ParseIP("10.252.0.2"),
-	}); err != nil {
-		t.Fatalf("route the destination through %s: %v", uplink.Attrs().Name, err)
-	}
+	uplink := createSocketAssignTestUplink(t)
 
 	dataPlane := &tcDataPlane{backend: backend, priority: 2}
 	delivery, err := dataPlane.createTCDeliveryLink()
@@ -183,6 +159,88 @@ func testTCLocalSocketAssignment(t *testing.T, mptcp bool) {
 	exchangeSocketAssignTestMessages(t, conn, accepted)
 	requireSocketAssignmentConsumed(t, backend, source)
 	requireNoTCAssignmentFailures(t, backend)
+}
+
+// TestTCLocalDeliveryFollowsDeliveryAddressChange covers the delivery
+// interface's address changing after the runtime programmed it as the
+// redirected frames' destination. The kernel drops frames addressed to any
+// other MAC as PACKET_OTHERHOST, so until the repair reprograms the backend no
+// redirected connection can reach the listener.
+func TestTCLocalDeliveryFollowsDeliveryAddressChange(t *testing.T) {
+	enterTestNetworkNamespace(t)
+	setLoopbackUp(t)
+	backend := newSocketAssignTestBackend(t, true)
+	listener := listenTransparentTCP(t, backend, false)
+	uplink := createSocketAssignTestUplink(t)
+
+	const priority = 2
+	dataPlane := &tcDataPlane{backend: backend, priority: priority}
+	delivery, err := dataPlane.createTCDeliveryLink()
+	if err != nil {
+		t.Fatalf("create the delivery link: %v", err)
+	}
+	t.Cleanup(func() { _ = delivery.Close() })
+	attachSocketAssignTestInterface(t, backend, uplink, tcInterfaceRole{local: true})
+	startSocketAssignTestRouting(t, backend)
+
+	replacement := net.HardwareAddr{0x02, 0x5b, 0x00, 0x00, 0x00, 0x01}
+	if bytes.Equal(delivery.delivery.Attrs().HardwareAddr, replacement) {
+		replacement[5]++
+	}
+	if err = netlink.LinkSetHardwareAddr(delivery.delivery, replacement); err != nil {
+		t.Fatalf("change the delivery interface address: %v", err)
+	}
+	healthy, err := delivery.healthy(priority)
+	if err != nil || healthy {
+		t.Fatalf("healthy = %v, %v after the delivery address changed, want unhealthy", healthy, err)
+	}
+	changed, replace, err := delivery.repair(backend, priority)
+	if err != nil || replace || !changed {
+		t.Fatalf("repair = changed %v, replace %v, %v; want the address reprogrammed in place", changed, replace, err)
+	}
+	if healthy, err = delivery.healthy(priority); err != nil || !healthy {
+		t.Fatalf("healthy = %v, %v after the repair, want healthy", healthy, err)
+	}
+
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp4", socketAssignTestDestination.String())
+	if err != nil {
+		t.Fatalf("connect through the local path: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	accepted := acceptSocketAssignTestConnection(t, listener)
+	exchangeSocketAssignTestMessages(t, conn, accepted)
+	requireNoTCAssignmentFailures(t, backend)
+}
+
+// createSocketAssignTestUplink creates the default interface the local path
+// attaches to, with 203.0.113.0/24 routed through a gateway that answers no
+// ARP; a permanent neighbour entry lets the connection's packets reach TC
+// egress.
+func createSocketAssignTestUplink(t *testing.T) netlink.Link {
+	t.Helper()
+	uplink, gateway := createTestVethPair(t, "sbsatcp2", "sbsatcp3")
+	addTestAddress(t, uplink, "10.252.0.1/24")
+	if err := netlink.NeighAdd(&netlink.Neigh{
+		LinkIndex:    uplink.Attrs().Index,
+		Family:       unix.AF_INET,
+		State:        netlink.NUD_PERMANENT,
+		IP:           net.ParseIP("10.252.0.2"),
+		HardwareAddr: gateway.Attrs().HardwareAddr,
+	}); err != nil {
+		t.Fatalf("add the gateway neighbour: %v", err)
+	}
+	_, destinationNetwork, err := net.ParseCIDR("203.0.113.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = netlink.RouteAdd(&netlink.Route{
+		LinkIndex: uplink.Attrs().Index,
+		Dst:       destinationNetwork,
+		Gw:        net.ParseIP("10.252.0.2"),
+	}); err != nil {
+		t.Fatalf("route the destination through %s: %v", uplink.Attrs().Name, err)
+	}
+	return uplink
 }
 
 func newSocketAssignTestBackend(t *testing.T, local bool) *commonEBPF.TCBackend {

@@ -571,6 +571,20 @@ func (d *tcDeliveryLink) repair(backend *commonEBPF.TCBackend, priority uint16) 
 	d.redirect = redirect
 	d.delivery = delivery
 	changed := false
+	// Anything that changes the delivery interface's address after creation
+	// (an administrator, a network manager) leaves the backend redirecting
+	// frames to a MAC the interface no longer accepts.
+	deliveryMAC, valid := tcDeliveryMACAddress(delivery)
+	if !valid {
+		return false, true, nil
+	}
+	if deliveryMAC != d.deliveryMAC {
+		if err = backend.SetDeliveryInterface(uint32(redirect.Attrs().Index), deliveryMAC); err != nil {
+			return false, false, E.Cause(err, "update TC eBPF delivery address")
+		}
+		d.deliveryMAC = deliveryMAC
+		changed = true
+	}
 	for _, link := range []netlink.Link{redirect, delivery} {
 		if link.Attrs().Flags&net.FlagUp != 0 {
 			continue

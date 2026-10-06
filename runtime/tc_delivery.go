@@ -3,8 +3,10 @@
 package runtime
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -24,10 +26,21 @@ func (d *tcDataPlane) createTCDeliveryLink() (*tcDeliveryLink, error) {
 	if err != nil {
 		return nil, err
 	}
+	redirectAddress, err := newTCDeliveryHardwareAddress()
+	if err != nil {
+		return nil, E.Cause(err, "generate TC eBPF redirect link address")
+	}
+	deliveryAddress, err := newTCDeliveryHardwareAddress()
+	if err != nil {
+		return nil, E.Cause(err, "generate TC eBPF delivery link address")
+	}
 	attributes := netlink.NewLinkAttrs()
 	attributes.Name = redirectName
-	veth := &netlink.Veth{LinkAttrs: attributes, PeerName: deliveryName}
+	attributes.HardwareAddr = redirectAddress
+	veth := &netlink.Veth{LinkAttrs: attributes, PeerName: deliveryName, PeerHardwareAddr: deliveryAddress}
+	udevSettle := beginTCUdevSettle(redirectName, deliveryName)
 	if err = netlink.LinkAdd(veth); err != nil {
+		udevSettle.close()
 		return nil, E.Cause(err, "create TC eBPF delivery link")
 	}
 	// The pair exists from here on, so it belongs to the delivery link before
@@ -43,6 +56,9 @@ func (d *tcDataPlane) createTCDeliveryLink() (*tcDeliveryLink, error) {
 		}
 		return nil, E.Errors(startErr, closeErr)
 	}
+	// udev rewrites rp_filter on every new interface; configuring the pair
+	// before it has finished would be undone moments later.
+	udevSettle.wait(tcUdevSettleTimeout)
 	redirect, err := linkByName(redirectName)
 	if err != nil {
 		return cleanup(E.Cause(err, "find TC eBPF redirect link"))
@@ -90,16 +106,42 @@ func (d *tcDataPlane) createTCDeliveryLink() (*tcDeliveryLink, error) {
 	if err != nil {
 		return cleanup(err)
 	}
-	deliveryHardwareAddress := delivery.delivery.Attrs().HardwareAddr
-	if len(deliveryHardwareAddress) != len(commonEBPF.MACAddress{}) {
+	deliveryMAC, valid := tcDeliveryMACAddress(delivery.delivery)
+	if !valid {
 		return cleanup(E.New("TC eBPF delivery interface has invalid hardware address"))
 	}
-	var deliveryMAC commonEBPF.MACAddress
-	copy(deliveryMAC[:], deliveryHardwareAddress)
 	if err = backend.SetDeliveryInterface(uint32(delivery.redirect.Attrs().Index), deliveryMAC); err != nil {
 		return cleanup(err)
 	}
+	delivery.deliveryMAC = deliveryMAC
 	return delivery, nil
+}
+
+// newTCDeliveryHardwareAddress returns a random locally administered unicast
+// MAC address for one end of the delivery pair.
+//
+// The redirect program rewrites each frame's destination to the delivery
+// interface's address, and the kernel drops a frame addressed to any other MAC
+// as PACKET_OTHERHOST. An address given at creation is marked NET_ADDR_SET,
+// which udev's MACAddressPolicy leaves alone; a kernel-generated one is
+// NET_ADDR_RANDOM and is replaced by udev shortly after the link appears.
+func newTCDeliveryHardwareAddress() (net.HardwareAddr, error) {
+	address := make(net.HardwareAddr, len(commonEBPF.MACAddress{}))
+	if _, err := rand.Read(address); err != nil {
+		return nil, err
+	}
+	address[0] = address[0]&^0x01 | 0x02
+	return address, nil
+}
+
+func tcDeliveryMACAddress(link netlink.Link) (commonEBPF.MACAddress, bool) {
+	var address commonEBPF.MACAddress
+	hardwareAddress := link.Attrs().HardwareAddr
+	if len(hardwareAddress) != len(address) {
+		return address, false
+	}
+	copy(address[:], hardwareAddress)
+	return address, true
 }
 
 // tcDeliveryInterfaceName reports whether name is a delivery interface name
