@@ -86,6 +86,12 @@ or cannot be attached, a consumer can register dialer and transparent-reply
 socket cookies once at creation time.
 Selected packets are addressed to the delivery peer, cross the veth, and are assigned at
 its ingress hook. L3-only links receive an Ethernet header before this redirect.
+Both veth ends get explicit locally administered MAC addresses at creation, and
+the runtime waits for udevd to finish processing the new pair before it
+configures it: otherwise systemd's default link policy replaces the delivery
+peer's address after it was programmed as the frames' destination, and the
+kernel drops every redirected frame as `PACKET_OTHERHOST`; systemd-sysctl
+likewise resets the peer's `rp_filter`.
 
 Shared `socket_assign` traffic is selected and assigned at TC ingress on each
 configured downstream interface. Shared `packet_rewrite` traffic is selected
@@ -114,7 +120,17 @@ the session and uses the token as the listener reply source so recvmsg can
 restore the original peer.
 
 Userspace rejects redirect address and route conflicts before attachment and
-owns only the local routes it created. The TCP token map is an LRU map so
+owns only the local routes it created. A socket bound to an interface
+(`SO_BINDTODEVICE`, `IP_UNICAST_IF` or `IPV6_UNICAST_IF`, as systemd-resolved
+binds its DNS sockets) routes with that interface as the required output
+device, which skips the prefix's loopback route and would send the redirected
+connection out of the interface. `LocalRouteSet.ReconcileInterfaceRoutes`
+therefore also installs each prefix as a local route on every interface that is
+up and has an address of the prefix's family, with that address as the
+preferred source so replies return on the bound interface; an IPv4 prefix is
+also installed on the loopback interface ahead of them, so unbound sockets keep
+`127.0.0.1`. These routes carry `rtm_protocol` 83, and the consumer reconciles
+them again after every interface or address change. The TCP token map is an LRU map so
 abandoned connect attempts cannot permanently exhaust it. UDP uses
 socket-release cleanup when the optional multi-program probe succeeds;
 otherwise it uses bounded LRU recovery. The probe never performs an
@@ -346,8 +362,8 @@ The worker refreshes the interface inventory, follows the current default
 interface for local interception, and compares every attachment by name,
 ifindex, framing, role, and installed filter identity. It also validates policy
 routing and the delivery link after network changes. Missing rules, routes,
-filters, delivery link state, and delivery sysctls are restored without periodic
-polling.
+filters, delivery link state, delivery sysctls, and a changed delivery peer
+address are restored without periodic polling.
 
 Configured shared interfaces that are absent at startup are attached when they
 appear; deleted or recreated interfaces are detached or replaced. A configured

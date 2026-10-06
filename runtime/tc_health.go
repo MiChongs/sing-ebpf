@@ -136,6 +136,9 @@ func (d *tcDeliveryLink) healthy(priority uint16) (bool, error) {
 		redirect.Attrs().Flags&net.FlagUp == 0 || delivery.Attrs().Flags&net.FlagUp == 0 {
 		return false, nil
 	}
+	if deliveryMAC, valid := tcDeliveryMACAddress(delivery); !valid || deliveryMAC != d.deliveryMAC {
+		return false, nil
+	}
 	attached, err := tcFilterAttached(
 		delivery,
 		netlink.HANDLE_MIN_INGRESS,

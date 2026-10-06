@@ -105,11 +105,14 @@ type tcInterfaceAttachment struct {
 }
 
 type tcDeliveryLink struct {
-	redirectName  string
-	deliveryName  string
-	redirect      netlink.Link
-	delivery      netlink.Link
-	filter        *netlink.BpfFilter
+	redirectName string
+	deliveryName string
+	redirect     netlink.Link
+	delivery     netlink.Link
+	filter       *netlink.BpfFilter
+	// deliveryMAC is the delivery interface address programmed into the
+	// backend as every redirected frame's destination.
+	deliveryMAC   commonEBPF.MACAddress
 	sysctls       []tcSysctlState
 	globalSysctls []tcSysctlState
 	// globalLease is this runtime's claim on the lowered conf.all.rp_filter,
