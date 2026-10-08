@@ -109,8 +109,14 @@ INLINE bool ipv4_token_address(__be32 address, const struct sb_shared_control *c
     return (host & mask) == (prefix & mask);
 }
 
+// Tokens fill the host half of a /64 prefix. Both the IPv6 header address and
+// the control prefix are 4-byte aligned, so the prefix compares as two words.
 INLINE bool ipv6_token_address(const __u8 address[16], const struct sb_shared_control *control) {
-    return equal_address(address, control->token_ipv6_prefix, 8U);
+    __u32 candidate[2];
+    __u32 prefix[2];
+    __builtin_memcpy(candidate, SB_ALIGNED4(address), sizeof(candidate));
+    __builtin_memcpy(prefix, SB_ALIGNED4(control->token_ipv6_prefix), sizeof(prefix));
+    return candidate[0] == prefix[0] && candidate[1] == prefix[1];
 }
 
 #endif

@@ -127,19 +127,10 @@ INLINE __u32 network_order32(__u32 value) {
 #endif
 }
 
-INLINE void copy_address(__u8 destination[16], const __u8 source[16], __u32 size) {
-#pragma clang loop unroll(full)
-    for (__u32 index = 0U; index < 16U; ++index) {
-        if (index < size) destination[index] = source[index];
-    }
-}
-
-INLINE bool equal_address(const __u8 left[16], const __u8 right[16], __u32 size) {
-#pragma clang loop unroll(full)
-    for (__u32 index = 0U; index < 16U; ++index) {
-        if (index < size && left[index] != right[index]) return false;
-    }
-    return true;
+// Every caller copies a whole IPv6 address between 4-byte aligned fields, an
+// IPv6 header address and a scratch address, so it moves words, not bytes.
+INLINE void copy_address(__u8 destination[16], const __u8 source[16]) {
+    __builtin_memcpy(__builtin_assume_aligned(destination, 4), __builtin_assume_aligned(source, 4), 16U);
 }
 
 #include "shared_network_policy.h"
@@ -411,8 +402,8 @@ NOINLINE int ingress_ipv6(
     scratch->original.original_port = destination_port;
     __builtin_memcpy(scratch->source_mac.address, &source_mac_first, 4U);
     __builtin_memcpy(scratch->source_mac.address + 4U, &source_mac_last, 2U);
-    copy_address(scratch->original.client_addr, ip->source, 16U);
-    copy_address(scratch->original.original_addr, ip->destination, 16U);
+    copy_address(scratch->original.client_addr, ip->source);
+    copy_address(scratch->original.original_addr, ip->destination);
     if (dhcp_packet(protocol, source_port, destination_port)) {
         return shared_ingress_pass();
     }
@@ -522,8 +513,8 @@ NOINLINE int egress_ipv6(
     scratch->listener_key.protocol = protocol;
     scratch->listener_key.client_port = network_order16(destination_port_raw);
     scratch->listener_key.listener_port = control->listener_port;
-    copy_address(scratch->listener_key.client_addr, ip->destination, 16U);
-    copy_address(scratch->listener_key.token_addr, ip->source, 16U);
+    copy_address(scratch->listener_key.client_addr, ip->destination);
+    copy_address(scratch->listener_key.token_addr, ip->source);
     struct sb_shared_original_value *original = map_lookup(
         &shared_flow_by_token,
         &scratch->listener_key);

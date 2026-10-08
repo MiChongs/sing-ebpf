@@ -293,11 +293,11 @@ INLINE __u32 network_order32(__u32 value) {
 #endif
 }
 
-INLINE void copy_address(__u8 destination[16], const __u8 source[16], __u32 size) {
-#pragma clang loop unroll(full)
-    for (__u32 index = 0U; index < 16U; ++index) {
-        destination[index] = index < size ? source[index] : 0U;
-    }
+// Every caller copies a whole IPv6 address between 4-byte aligned fields: an
+// IPv6 header address, an assignment key address or a bpf_sock_tuple address.
+// Word moves replace the 16 byte loads and stores per address.
+INLINE void copy_address(__u8 destination[16], const __u8 source[16]) {
+    __builtin_memcpy(__builtin_assume_aligned(destination, 4), __builtin_assume_aligned(source, 4), 16U);
 }
 
 INLINE const struct sb_tc_control *load_control(void) {
@@ -591,8 +591,8 @@ INLINE int fill_ipv6_key(void *data, void *data_end, __u32 l3_offset,
     key->protocol = protocol;
     key->source_port = source_port;
     key->destination_port = destination_port;
-    copy_address(key->source_addr, ip->source, 16U);
-    copy_address(key->destination_addr, ip->destination, 16U);
+    copy_address(key->source_addr, ip->source);
+    copy_address(key->destination_addr, ip->destination);
     return SB_TC_PARSE_FLOW;
 }
 
@@ -677,8 +677,8 @@ NOINLINE struct bpf_sock *lookup_tcp_socket(struct __sk_buff *skb,
         tuple.ipv4.dport = network_order16(key->destination_port);
         tuple_size = sizeof(tuple.ipv4);
     } else {
-        copy_address((__u8 *)&tuple.ipv6.saddr, key->source_addr, 16U);
-        copy_address((__u8 *)&tuple.ipv6.daddr, key->destination_addr, 16U);
+        copy_address((__u8 *)&tuple.ipv6.saddr, key->source_addr);
+        copy_address((__u8 *)&tuple.ipv6.daddr, key->destination_addr);
         tuple.ipv6.sport = network_order16(key->source_port);
         tuple.ipv6.dport = network_order16(key->destination_port);
         tuple_size = sizeof(tuple.ipv6);
@@ -714,8 +714,8 @@ NOINLINE struct bpf_sock *lookup_tcp_socket_legacy(struct __sk_buff *skb,
         tuple.ipv4.dport = network_order16(key->destination_port);
         tuple_size = sizeof(tuple.ipv4);
     } else {
-        copy_address((__u8 *)&tuple.ipv6.saddr, key->source_addr, 16U);
-        copy_address((__u8 *)&tuple.ipv6.daddr, key->destination_addr, 16U);
+        copy_address((__u8 *)&tuple.ipv6.saddr, key->source_addr);
+        copy_address((__u8 *)&tuple.ipv6.daddr, key->destination_addr);
         tuple.ipv6.sport = network_order16(key->source_port);
         tuple.ipv6.dport = network_order16(key->destination_port);
         tuple_size = sizeof(tuple.ipv6);
@@ -749,8 +749,8 @@ NOINLINE struct bpf_sock *lookup_udp_socket(struct __sk_buff *skb,
         tuple.ipv4.dport = network_order16(control->listener_port);
         tuple_size = sizeof(tuple.ipv4);
     } else {
-        copy_address((__u8 *)&tuple.ipv6.saddr, key->source_addr, 16U);
-        copy_address((__u8 *)&tuple.ipv6.daddr, key->destination_addr, 16U);
+        copy_address((__u8 *)&tuple.ipv6.saddr, key->source_addr);
+        copy_address((__u8 *)&tuple.ipv6.daddr, key->destination_addr);
         tuple.ipv6.sport = network_order16(key->source_port);
         tuple.ipv6.dport = network_order16(control->listener_port);
         tuple_size = sizeof(tuple.ipv6);
