@@ -71,19 +71,22 @@ func putEthernetIPv4Header(frame []byte, dstMAC, srcMAC net.HardwareAddr, protoc
 	return ip[20:]
 }
 
-// buildEthernetIPv4UDP builds a checksummed UDP datagram.
-func buildEthernetIPv4UDP(dstMAC, srcMAC net.HardwareAddr, source, destination netip.AddrPort, payload []byte) []byte {
+// buildEthernetIPv4UDP builds a UDP datagram. Without checksummed it carries
+// no checksum, which IPv4 allows and a rewrite must keep.
+func buildEthernetIPv4UDP(dstMAC, srcMAC net.HardwareAddr, source, destination netip.AddrPort, payload []byte, checksummed bool) []byte {
 	frame := make([]byte, 14+20+8+len(payload))
 	udp := putEthernetIPv4Header(frame, dstMAC, srcMAC, unix.IPPROTO_UDP, source.Addr(), destination.Addr())
 	binary.BigEndian.PutUint16(udp[0:2], source.Port())
 	binary.BigEndian.PutUint16(udp[2:4], destination.Port())
 	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
 	copy(udp[8:], payload)
-	checksum := ipv4TransportChecksum(source.Addr(), destination.Addr(), unix.IPPROTO_UDP, udp, 6)
-	if checksum == 0 {
-		checksum = 0xffff
+	if checksummed {
+		checksum := ipv4TransportChecksum(source.Addr(), destination.Addr(), unix.IPPROTO_UDP, udp, 6)
+		if checksum == 0 {
+			checksum = 0xffff
+		}
+		binary.BigEndian.PutUint16(udp[6:8], checksum)
 	}
-	binary.BigEndian.PutUint16(udp[6:8], checksum)
 	return frame
 }
 
