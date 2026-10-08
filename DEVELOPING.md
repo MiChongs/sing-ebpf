@@ -308,7 +308,15 @@ object/program variant. Before Linux 5.2 the verifier rejects a log buffer over
 hide the real error, typically E2BIG from the 131072-instruction complexity
 limit; the loader then repeats the load without a log to report it. Changes to
 the shared packet-rewrite ingress program should be loaded on a 4.19 kernel,
-which has the least verifier headroom. For runtime failures, collect:
+which has the least verifier headroom. `TestSelectedObjectLoadProbeIntegration`
+needs no kernel modules, so a statically linked test binary can run as the init
+of a small initramfs under any distribution kernel image in QEMU.
+
+Call a helper that changes packet data, such as `bpf_skb_pull_data`, before
+parsing, and load the packet pointers again after it through a volatile read.
+Verifiers before Linux 5.10 forget the bounds of a scalar spilled to the stack
+across a helper call, so a parsed offset kept across the pull makes them walk
+the rest of the program once per side of it. For runtime failures, collect:
 
 - active attachment descriptions and effective mechanisms;
 - first error and timestamp, recovery state, and retry deadline;

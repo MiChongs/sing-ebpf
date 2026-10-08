@@ -110,6 +110,27 @@ func testTCSharedSocketAssignment(t *testing.T, mptcp bool) {
 
 	exchangeSocketAssignTestMessages(t, conn, accepted)
 	requireSocketAssignmentConsumed(t, backend, source)
+
+	// A SYN whose headers sit in page fragments used to bypass assignment.
+	pagedSource := netip.MustParseAddrPort("10.251.0.2:40002")
+	sendPagedFrame(t, router, client, "sbsatcp1", func(clientMAC net.HardwareAddr) []byte {
+		return buildEthernetIPv4TCPSYN(router.Attrs().HardwareAddr, clientMAC, pagedSource, socketAssignTestDestination,
+			bytes.Repeat([]byte{'s'}, pagedFramePayloadLength))
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		assignment, err = backend.LookupAssignment(commonEBPF.ProtocolTCP, pagedSource, socketAssignTestDestination, 0, true)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no assignment for the SYN whose headers were in page fragments: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if assignment.Path != commonEBPF.TCPathShared || assignment.InterfaceIndex != uint32(router.Attrs().Index) {
+		t.Fatalf("paged SYN assignment = %+v, want the shared path on %s", assignment, router.Attrs().Name)
+	}
 	requireNoTCAssignmentFailures(t, backend)
 }
 

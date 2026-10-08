@@ -269,6 +269,7 @@ static struct bpf_sock *(*sk_lookup_udp)(void *ctx, struct bpf_sock_tuple *tuple
 static long (*sk_assign)(void *ctx, struct bpf_sock *socket, __u64 flags) =
     (void *)BPF_FUNC_sk_assign;
 static void (*sk_release)(struct bpf_sock *socket) = (void *)BPF_FUNC_sk_release;
+static long (*skb_pull_data)(void *ctx, __u32 length) = (void *)BPF_FUNC_skb_pull_data;
 
 INLINE void increment_stat(__u32 index) {
     if (index >= SB_TC_STAT_COUNT) return;
@@ -595,13 +596,49 @@ INLINE int fill_ipv6_key(void *data, void *data_end, __u32 l3_offset,
     return SB_TC_PARSE_FLOW;
 }
 
-// parse_flow fills key for a TCP/UDP flow the data planes may select. A
-// fragment is reported separately so that each caller decides whether and
-// where to count it.
-INLINE int parse_flow(struct __sk_buff *skb, const struct sb_tc_control *control,
-    __u32 ipv6_flag, bool ethernet, struct sb_tc_assign_key *key, __u8 source_mac[6], __u8 *flags) {
+// Volatile so that both sides of the pull load the pointers again after it
+// and reach the parser in the same verifier state.
+#define SKB_DATA(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data)
+#define SKB_DATA_END(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data_end)
+
+// Drivers that build received packets in page fragments (napi_gro_frags users
+// such as mlx4, sfc and gve, or any device with GRO off) can leave headers GRO
+// did not parse, such as a UDP header, outside the linear area that direct
+// packet access reads, and the packet would bypass its assignment. The pull
+// covers the longest header layout parsed before the transport ports and
+// happens before anything is parsed: a packet value kept across the helper
+// call loses its bounds on older verifiers, which then walk the rest of the
+// program once per side of the pull. A packet whose first bytes are linear,
+// including every short linear packet, only pays the compare.
+#define SB_TC_PULL_LENGTH_ETHERNET (sizeof(struct ethernet_header) + 2U * sizeof(struct vlan_header) + \
+    sizeof(struct ipv6_header) + 8U)
+#define SB_TC_PULL_LENGTH_RAW_IP (sizeof(struct ipv6_header) + 8U)
+
+INLINE void pull_headers(struct __sk_buff *skb, __u32 length) {
+    __u32 available = skb->len;
+    if (available < length) length = available;
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
+    if (data + length <= data_end) return;
+    (void)skb_pull_data(skb, length);
+}
+
+// parse_flow fills key for a TCP/UDP flow the data planes may select. A
+// fragment is reported separately so that each caller decides whether and
+// where to count it. Ingress callers pull headers a driver left in page
+// fragments; locally built egress packets always have them linear.
+INLINE int parse_flow(struct __sk_buff *skb, const struct sb_tc_control *control,
+    __u32 ipv6_flag, bool ethernet, bool pull, struct sb_tc_assign_key *key, __u8 source_mac[6], __u8 *flags) {
+    void *data;
+    void *data_end;
+    if (pull) {
+        pull_headers(skb, ethernet ? SB_TC_PULL_LENGTH_ETHERNET : SB_TC_PULL_LENGTH_RAW_IP);
+        data = SKB_DATA(skb);
+        data_end = SKB_DATA_END(skb);
+    } else {
+        data = (void *)(long)skb->data;
+        data_end = (void *)(long)skb->data_end;
+    }
     __u16 ether_type;
     __u32 l3_offset;
     if (ethernet) {
@@ -895,7 +932,7 @@ INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_pr
     // select (disabled families, other protocols, service or safety
     // addresses) then skip it. Fragments are still counted only after the
     // self-bypass check.
-    int parsed = parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, ethernet, &key, source_mac, &flags);
+    int parsed = parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, ethernet, false, &key, source_mac, &flags);
     if (parsed == SB_TC_PARSE_PASS) return TC_ACT_UNSPEC;
     __u64 socket_cookie = get_socket_cookie(skb);
     __u32 socket_metadata_value = socket_metadata(socket_cookie);
@@ -935,7 +972,7 @@ INLINE int shared_ingress(struct __sk_buff *skb, bool ethernet) {
     struct sb_tc_assign_key key;
     __u8 source_mac[6];
     __u8 flags;
-    int parsed = parse_flow(skb, control, SB_TC_FLAG_SHARED_IPV6, ethernet, &key, source_mac, &flags);
+    int parsed = parse_flow(skb, control, SB_TC_FLAG_SHARED_IPV6, ethernet, true, &key, source_mac, &flags);
     if (parsed != SB_TC_PARSE_FLOW) return parse_pass(parsed, SB_TC_STAT_SHARED_FRAGMENT_PASS);
     if (!ethernet &&
         (control->flags & (SB_TC_FLAG_INCLUDE_SOURCE_MAC | SB_TC_FLAG_EXCLUDE_SOURCE_MAC)) != 0U) {
@@ -964,7 +1001,7 @@ INLINE int shared_ingress_legacy(struct __sk_buff *skb, bool ethernet) {
     struct sb_tc_assign_key key;
     __u8 source_mac[6];
     __u8 flags;
-    int parsed = parse_flow(skb, control, SB_TC_FLAG_SHARED_IPV6, ethernet, &key, source_mac, &flags);
+    int parsed = parse_flow(skb, control, SB_TC_FLAG_SHARED_IPV6, ethernet, true, &key, source_mac, &flags);
     if (parsed != SB_TC_PARSE_FLOW) return parse_pass(parsed, SB_TC_STAT_SHARED_FRAGMENT_PASS);
     if (!ethernet &&
         (control->flags & (SB_TC_FLAG_INCLUDE_SOURCE_MAC | SB_TC_FLAG_EXCLUDE_SOURCE_MAC)) != 0U) {
@@ -993,7 +1030,7 @@ INLINE int shared_ingress_udp(struct __sk_buff *skb, bool ethernet) {
     struct sb_tc_assign_key key;
     __u8 source_mac[6];
     __u8 flags;
-    int parsed = parse_flow(skb, control, SB_TC_FLAG_SHARED_IPV6, ethernet, &key, source_mac, &flags);
+    int parsed = parse_flow(skb, control, SB_TC_FLAG_SHARED_IPV6, ethernet, true, &key, source_mac, &flags);
     if (parsed != SB_TC_PARSE_FLOW) return parse_pass(parsed, SB_TC_STAT_SHARED_FRAGMENT_PASS);
     if (!ethernet &&
         (control->flags & (SB_TC_FLAG_INCLUDE_SOURCE_MAC | SB_TC_FLAG_EXCLUDE_SOURCE_MAC)) != 0U) {
@@ -1023,7 +1060,7 @@ int sing_ebpf_tc_delivery_ingress(struct __sk_buff *skb) {
     struct sb_tc_assign_key key;
     __u8 source_mac[6];
     __u8 flags;
-    if (parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, true, &key, source_mac, &flags) != SB_TC_PARSE_FLOW)
+    if (parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, true, false, &key, source_mac, &flags) != SB_TC_PARSE_FLOW)
         return TC_ACT_UNSPEC;
     skb->mark |= control->routing_mark;
     return assign_socket(skb, control, &key, source_mac, SB_TC_PATH_DELIVERY);
@@ -1036,7 +1073,7 @@ int sing_ebpf_tc_delivery_ingress_legacy(struct __sk_buff *skb) {
     struct sb_tc_assign_key key;
     __u8 source_mac[6];
     __u8 flags;
-    if (parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, true, &key, source_mac, &flags) != SB_TC_PARSE_FLOW)
+    if (parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, true, false, &key, source_mac, &flags) != SB_TC_PARSE_FLOW)
         return TC_ACT_UNSPEC;
     skb->mark |= control->routing_mark;
     return assign_socket_legacy(skb, control, &key, source_mac, SB_TC_PATH_DELIVERY);
@@ -1049,7 +1086,7 @@ int sing_ebpf_tc_delivery_ingress_udp(struct __sk_buff *skb) {
     struct sb_tc_assign_key key;
     __u8 source_mac[6];
     __u8 flags;
-    if (parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, true, &key, source_mac, &flags) != SB_TC_PARSE_FLOW)
+    if (parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, true, false, &key, source_mac, &flags) != SB_TC_PARSE_FLOW)
         return TC_ACT_UNSPEC;
     skb->mark |= control->routing_mark;
     return assign_udp_socket(skb, control, &key, source_mac, SB_TC_PATH_DELIVERY);

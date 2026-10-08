@@ -193,7 +193,7 @@ func readICMPEchoReplyFrame(
 	parse func(*testing.T, []byte) *parsedICMPEchoReply,
 ) (*parsedICMPEchoReply, int) {
 	t.Helper()
-	buffer := make([]byte, 1500)
+	buffer := make([]byte, 1<<16)
 	for attempt := 0; attempt < 8; attempt++ {
 		n, readErr := unix.Read(peerSocket, buffer)
 		if readErr != nil {

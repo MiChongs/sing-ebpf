@@ -77,6 +77,7 @@ static long (*l3_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, 
     (void *)BPF_FUNC_l3_csum_replace;
 static long (*l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) =
     (void *)BPF_FUNC_l4_csum_replace;
+static long (*skb_pull_data)(struct __sk_buff *skb, __u32 length) = (void *)BPF_FUNC_skb_pull_data;
 INLINE void record_shared_stat(__u32 key) {
     __u64 *counter = map_lookup(&shared_stats, &key);
     if (counter != 0) *counter += 1U;
@@ -542,12 +543,40 @@ NOINLINE int egress_ipv6(
         protocol);
 }
 
+// Drivers that build received packets in page fragments (napi_gro_frags users
+// such as mlx4, sfc and gve, or any device with GRO off) can leave headers GRO
+// did not parse, such as a UDP header, outside the linear area that direct
+// packet access reads; ingress would then drop the packet as truncated. The
+// pull covers the longest header layout parsed before the transport ports and
+// happens before anything is parsed: a packet value kept across the helper
+// call loses its bounds on verifiers before Linux 5.10, which then walk the
+// rewrite path once per side of the pull and exceed the 4.19 complexity limit.
+// A packet whose first bytes are linear, including every short linear packet,
+// only pays the compare.
+#define SB_SHARED_PULL_LENGTH (sizeof(struct ethernet_header) + 2U * sizeof(struct vlan_header) + \
+    sizeof(struct ipv6_header) + sizeof(struct udp_header_min))
+
+// Volatile so that both sides of the pull load the pointers again after it
+// and reach the parser in the same verifier state.
+#define SKB_DATA(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data)
+#define SKB_DATA_END(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data_end)
+
+INLINE void pull_headers(struct __sk_buff *skb, __u32 length) {
+    __u32 available = skb->len;
+    if (available < length) length = available;
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    if (data + length <= data_end) return;
+    (void)skb_pull_data(skb, length);
+}
+
 NOINLINE int classify_ingress(struct __sk_buff *skb) {
     __u32 zero = 0U;
     struct sb_shared_control *control = map_lookup(&shared_control, &zero);
     if (control == 0 || control->enabled == 0U) return shared_ingress_pass();
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+    pull_headers(skb, SB_SHARED_PULL_LENGTH);
+    void *data = SKB_DATA(skb);
+    void *data_end = SKB_DATA_END(skb);
     struct ethernet_header *ethernet = data;
     if ((void *)(ethernet + 1) > data_end) return shared_ingress_pass();
     __u16 protocol = network_order16(ethernet->protocol);

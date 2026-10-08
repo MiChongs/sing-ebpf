@@ -3,6 +3,7 @@
 package runtime
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -163,12 +164,35 @@ func openRawLinkLayerSocket(t *testing.T, interfaceIndex int, etherType uint16, 
 // TestICMPEchoSharedReplyAnswersARealClientPing injects a raw frame so its
 // source behaves like a LAN client not owned by the test host.
 func TestICMPEchoSharedReplyAnswersARealClientPing(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		payloadLength int
+	}{
+		{name: "linear"},
+		// The request reaches ingress with its IP and ICMP headers in page
+		// fragments; see sendPagedFrame.
+		{name: "page_fragments", payloadLength: pagedFramePayloadLength},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			testICMPEchoSharedReplyAnswersARealClientPing(t, testCase.payloadLength)
+		})
+	}
+}
+
+func testICMPEchoSharedReplyAnswersARealClientPing(t *testing.T, payloadLength int) {
 	enterTestNetworkNamespace(t)
 	backend := newRealICMPEchoReplyBackend(t)
 	t.Cleanup(func() { _ = backend.Close() })
 	repliesBefore := icmpEchoReplyCount(t, backend)
 
 	self, peer := createTestVethPair(t, "sbicmpw0", "sbicmpw1")
+	if payloadLength > 0 {
+		for _, link := range []netlink.Link{self, peer} {
+			if err := netlink.LinkSetMTU(link, pagedFrameMTU); err != nil {
+				t.Fatalf("raise the MTU of %s: %v", link.Attrs().Name, err)
+			}
+		}
+	}
 
 	forceTCClsact(t) // see TestICMPEchoLocalReplyAnswersARealPingViaTCX for the TCX case.
 	const priority = 2
@@ -203,6 +227,9 @@ func TestICMPEchoSharedReplyAnswersARealClientPing(t *testing.T) {
 	const identifier = 0x4321
 	const sequence = 3
 	payload := []byte("force_intercept-icmp-shared-reply-test-payload")
+	if payloadLength > 0 {
+		payload = bytes.Repeat([]byte{'i'}, payloadLength)
+	}
 
 	requestFrame := buildEthernetIPv4EchoRequest(
 		self.Attrs().HardwareAddr, peer.Attrs().HardwareAddr,

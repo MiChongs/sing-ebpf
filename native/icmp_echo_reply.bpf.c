@@ -152,6 +152,7 @@ static long (*l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, 
     (void *)BPF_FUNC_l4_csum_replace;
 static __s64 (*csum_diff)(const __be32 *from, __u32 from_size, const __be32 *to, __u32 to_size, __wsum seed) =
     (void *)BPF_FUNC_csum_diff;
+static long (*skb_pull_data)(void *ctx, __u32 length) = (void *)BPF_FUNC_skb_pull_data;
 
 INLINE void record_icmp_echo_reply_stat(__u32 key) {
     __u64 *counter = map_lookup(&icmp_echo_reply_stats, &key);
@@ -172,6 +173,31 @@ INLINE __u32 network_order32(__be32 value) {
 #else
     return value;
 #endif
+}
+
+// Drivers that build received packets in page fragments (napi_gro_frags users
+// such as mlx4, sfc and gve, or any device with GRO off) can leave the ICMP
+// header outside the linear area that direct packet access reads, and the
+// request would go unanswered. The pull covers the longest header layout this
+// object parses and happens before anything is parsed, so no packet value has
+// to survive the helper call. A packet whose first bytes are linear, including
+// every short linear packet, only pays the compare.
+#define SB_ICMP_PULL_LENGTH_ETHERNET (sizeof(struct ethernet_header) + 2U * sizeof(struct vlan_header) + \
+    sizeof(struct ipv6_header) + sizeof(struct icmp_echo_header))
+#define SB_ICMP_PULL_LENGTH_RAW_IP (sizeof(struct ipv6_header) + sizeof(struct icmp_echo_header))
+
+// Volatile so that both sides of the pull load the pointers again after it
+// and reach the parser in the same verifier state.
+#define SKB_DATA(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data)
+#define SKB_DATA_END(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data_end)
+
+INLINE void pull_headers(struct __sk_buff *skb, __u32 length) {
+    __u32 available = skb->len;
+    if (available < length) length = available;
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    if (data + length <= data_end) return;
+    (void)skb_pull_data(skb, length);
 }
 
 INLINE const struct sb_icmp_echo_reply_control *load_control(void) {
@@ -515,8 +541,9 @@ int sing_ebpf_icmp_echo_reply_local_reply_raw_ip(struct __sk_buff *skb) {
 INLINE int shared_reply(struct __sk_buff *skb, bool ethernet) {
     const struct sb_icmp_echo_reply_control *control = load_control();
     if (control == 0 || (control->flags & SB_ICMP_ECHO_REPLY_FLAG_ENABLED) == 0U) return TC_ACT_UNSPEC;
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+    pull_headers(skb, ethernet ? SB_ICMP_PULL_LENGTH_ETHERNET : SB_ICMP_PULL_LENGTH_RAW_IP);
+    void *data = SKB_DATA(skb);
+    void *data_end = SKB_DATA_END(skb);
     __u16 ether_type;
     __u32 l3_offset;
     if (ethernet) {
