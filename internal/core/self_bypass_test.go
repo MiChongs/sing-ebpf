@@ -3,7 +3,9 @@
 package core
 
 import (
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -74,9 +76,9 @@ func TestProcessCgroupExclusiveRejectsPopulatedDescendant(t *testing.T) {
 
 func TestSelfBypassInstructionsUseSocketCookie(t *testing.T) {
 	for name, instructions := range map[string]asm.Instructions{
-		"create":      selfBypassCreateInstructions(1),
+		"create":      selfBypassCreateInstructions(1, 1),
 		"release":     selfBypassReleaseInstructions(1),
-		"socket_addr": selfBypassSocketAddrInstructions(1),
+		"socket_addr": selfBypassSocketAddrInstructions(1, 1),
 	} {
 		found := false
 		for _, instruction := range instructions {
@@ -88,6 +90,67 @@ func TestSelfBypassInstructionsUseSocketCookie(t *testing.T) {
 		if !found {
 			t.Fatalf("%s self-bypass instructions do not read the socket cookie", name)
 		}
+	}
+}
+
+func TestSelfBypassMarkingInstructionsCheckOwner(t *testing.T) {
+	const owner = 4242
+	for name, instructions := range map[string]asm.Instructions{
+		"create":      selfBypassCreateInstructions(1, owner),
+		"socket_addr": selfBypassSocketAddrInstructions(1, owner),
+	} {
+		pidIndex, cookieIndex, ownerJump := -1, -1, false
+		for index, instruction := range instructions {
+			if instruction.IsBuiltinCall() {
+				switch asm.BuiltinFunc(instruction.Constant) {
+				case asm.FnGetCurrentPidTgid:
+					if pidIndex < 0 {
+						pidIndex = index
+					}
+				case asm.FnGetSocketCookie:
+					if cookieIndex < 0 {
+						cookieIndex = index
+					}
+				}
+			}
+			if instruction.OpCode.JumpOp() == asm.JNE && instruction.Constant == owner && instruction.Reference() == "allow" {
+				ownerJump = true
+			}
+		}
+		if pidIndex < 0 || cookieIndex < 0 || pidIndex > cookieIndex || !ownerJump {
+			t.Fatalf("%s self-bypass instructions do not skip sockets of other processes: pid=%d cookie=%d jump=%v", name, pidIndex, cookieIndex, ownerJump)
+		}
+		if first := instructions[0]; first.OpCode.ALUOp() != asm.Mov || first.Dst != asm.R6 || first.Src != asm.R1 {
+			t.Fatalf("%s self-bypass instructions do not preserve the context: %v", name, first)
+		}
+		if restore := instructions[cookieIndex-1]; restore.OpCode.ALUOp() != asm.Mov || restore.Dst != asm.R1 || restore.Src != asm.R6 {
+			t.Fatalf("%s self-bypass instructions do not restore the context before the cookie helper: %v", name, restore)
+		}
+		if err := instructions.Marshal(io.Discard, binary.LittleEndian); err != nil {
+			t.Fatalf("%s self-bypass instructions do not assemble: %v", name, err)
+		}
+	}
+	for _, instruction := range selfBypassReleaseInstructions(1) {
+		if instruction.IsBuiltinCall() && asm.BuiltinFunc(instruction.Constant) == asm.FnGetCurrentPidTgid {
+			t.Fatal("release instructions must delete any registered cookie regardless of the releasing task")
+		}
+	}
+}
+
+func TestSelfBypassOwnerTGID(t *testing.T) {
+	namespace, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Skipf("PID namespace is not readable: %v", err)
+	}
+	owner, err := selfBypassOwnerTGID()
+	if namespace != initialPIDNamespaceLink {
+		if err == nil {
+			t.Fatalf("owner %d accepted outside the initial PID namespace (%s)", owner, namespace)
+		}
+		return
+	}
+	if err != nil || owner != uint32(os.Getpid()) {
+		t.Fatalf("owner = %d, %v; want %d", owner, err, os.Getpid())
 	}
 }
 
