@@ -62,13 +62,16 @@ func TestLocalRouteSetReachesListenerFromBoundSockets(t *testing.T) {
 		t.Fatalf("an unbound socket reached the listener from %s, want 127.0.0.1", peer)
 	}
 
-	// The kernel deletes a route together with its source address.
-	replaceRouteTestAddress(t, uplink, "10.252.0.1/24", "10.252.0.9/24")
+	// The kernel deletes a route together with its source address. The new
+	// IPv4 address is in another subnet: one added to the old address's subnet
+	// is a secondary, and unless promote_secondaries is set, which systemd
+	// does but a kernel default does not, removing the primary removes it too.
+	replaceRouteTestAddress(t, uplink, "10.252.0.1/24", "10.252.1.9/24")
 	replaceRouteTestAddress(t, uplink, "fd00:5b::1/64", "fd00:5b::9/64")
 	if changed, err = routes.ReconcileInterfaceRoutes(); err != nil || !changed {
 		t.Fatalf("ReconcileInterfaceRoutes after an address change = %v, %v; want the routes restored", changed, err)
 	}
-	requireRouteTestBoundSocketsReach(t, uplink, "10.252.0.9", "fd00:5b::9")
+	requireRouteTestBoundSocketsReach(t, uplink, "10.252.1.9", "fd00:5b::9")
 
 	if err = netlink.LinkSetDown(uplink); err != nil {
 		t.Fatalf("take the uplink down: %v", err)
