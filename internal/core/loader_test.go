@@ -25,7 +25,7 @@ func TestRawCgroupAttachPrefersMulti(t *testing.T) {
 		options = current
 		return nil
 	}
-	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCgroupInetSockRelease)
+	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCgroupInetSockRelease)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestRawCgroupAttachFallsBackToExclusiveAfterMultiCompatibilityError(t *test
 		}
 		return nil
 	}
-	if _, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
+	if err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(flags, []uint32{unix.BPF_F_ALLOW_MULTI, 0}) {
@@ -99,7 +99,7 @@ func TestRawCgroupAttachPreservesExistingOwner(t *testing.T) {
 		return &link.QueryResult{Programs: []link.AttachedProgram{{ID: 1}}}, nil
 	}
 	describeCgroupProgram = func(CiliumEBPF.ProgramID) string { return "id=1 name=netd_conn4" }
-	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
 	if err == nil {
 		t.Fatal("existing cgroup owner was replaced")
 	}
@@ -135,7 +135,7 @@ func TestRawCgroupAttachOccupiedErrorNamesOwners(t *testing.T) {
 		}
 		return "id=57 name=foreign_conn4"
 	}
-	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
 	if !errors.Is(err, ErrCgroupHookOccupied) {
 		t.Fatalf("error = %v, want ErrCgroupHookOccupied", err)
 	}
@@ -170,7 +170,7 @@ func TestRawCgroupAttachFallbackErrors(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
+			if err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
 				t.Fatal(err)
 			}
 			if !slices.Equal(flags, []uint32{unix.BPF_F_ALLOW_MULTI, 0}) {
@@ -189,7 +189,7 @@ func TestRawCgroupAttachDoesNotFallbackOnFatalError(t *testing.T) {
 		callCount++
 		return wantErr
 	}
-	_, err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
 	}
