@@ -661,6 +661,46 @@ func (b *TCBackend) LookupAssignment(protocol uint8, source, destination netip.A
 	return assignment, nil
 }
 
+// RemoveAssignmentIfMatch removes one TC assignment only when the value still
+// belongs to the session which is being closed. UDP assignment keys can be
+// reused quickly, so an unconditional delete from a timeout callback could
+// remove a newer session's entry. A missing entry or a value mismatch is a
+// successful no-op; LRU eviction remains the fallback for entries which are
+// not observed by userspace during their lifetime.
+func (b *TCBackend) RemoveAssignmentIfMatch(
+	protocol uint8,
+	source, destination netip.AddrPort,
+	interfaceIndex uint32,
+	expected TCAssignment,
+) (bool, error) {
+	key, err := makeTCAssignKey(protocol, source, destination, interfaceIndex)
+	if err != nil {
+		return false, err
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return false, errBackendClosed
+	}
+	var current TCAssignment
+	if err = lookupMap(b.assignmentMapFD, unsafe.Pointer(&key), unsafe.Pointer(&current)); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+		return false, err
+	}
+	if current != expected {
+		return false, nil
+	}
+	if err = deleteMap(b.assignmentMapFD, unsafe.Pointer(&key)); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // Stats reads the native TC error counters on demand. It performs one map
 // lookup per counter and never runs from a background worker or timer.
 func (b *TCBackend) Stats() (TCStats, error) {
