@@ -388,6 +388,74 @@ func TestCgroupUDPFlowCacheRevalidatesRedirect(t *testing.T) {
 	}
 }
 
+// TestCgroupUDPReleaseNotificationDropsCountOnlyLostEvents requires the drop
+// counter to mean what UDPReleaseNotificationDrops documents: an event the
+// full ring could not take. Unconnected sockets have no token to report.
+func TestCgroupUDPReleaseNotificationDropsCountOnlyLostEvents(t *testing.T) {
+	const listenerPort = 41011
+	backend := startCgroupUDPIntegrationBackend(t, 102, listenerPort)
+	if backend.UDPUserspaceCleanupMode() != cgroupUDPUserspaceCleanupRingBuffer {
+		t.Skip("socket-release notification is unavailable")
+	}
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: listenerPort})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	destination := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 8), Port: 9}
+
+	unconnected, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = unconnected.WriteToUDP([]byte("unconnected"), destination); err != nil {
+		t.Fatal(err)
+	}
+	assertUDPReceived(t, listener, "unconnected")
+	if err = unconnected.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	connected, err := net.DialUDP("udp4", nil, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie, err := udpSocketCookie(connected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connected.Close(); err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan UDPReleaseEvent, 1)
+	readErrors := make(chan error, 1)
+	go func() {
+		event, readErr := backend.ReadUDPRelease()
+		if readErr != nil {
+			readErrors <- readErr
+			return
+		}
+		events <- event
+	}()
+	select {
+	case event := <-events:
+		if event.SocketCookie != cookie {
+			t.Fatalf("UDP release event for socket %d, want the connected socket %d", event.SocketCookie, cookie)
+		}
+	case readErr := <-readErrors:
+		t.Fatal(readErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no UDP release event for the connected socket")
+	}
+	drops, err := backend.UDPReleaseNotificationDrops()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drops != 0 {
+		t.Fatalf("UDP release notification drops = %d with an empty ring, want 0", drops)
+	}
+}
+
 // startCgroupUDPIntegrationBackend attaches an IPv4 UDP backend that
 // intercepts every destination to a dedicated cgroup and moves this process
 // into it.

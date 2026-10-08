@@ -419,8 +419,10 @@ INLINE void watch_udp_release(
         (config->flags & SB_EBPF_CGROUP_FLAG_UDP_RELEASE_NOTIFY) == 0U) return;
     if (map_lookup(&cgroup_udp_release_watch, &cookie) != 0) return;
     __u8 value = 1U;
-    // The first intercepted datagram is enough. The no-exist flag also closes
-    // a race between concurrent sends; userspace's UDP deadline remains the
+    // Only a connected socket owns a token the release hook can report, so
+    // callers watch it once its connect is redirected; an unconnected socket's
+    // redirects are left to userspace's UDP deadline. The no-exist flag closes
+    // a race between concurrent connects; the deadline also remains the
     // fallback if this optional notification map is full.
     (void)map_update(&cgroup_udp_release_watch, &cookie, &value, BPF_NOEXIST);
 }
@@ -632,7 +634,7 @@ INLINE int handle_v4(
         flow_store(config, AF_INET_VALUE, protocol, port, flow_address,
             cookie, SB_EBPF_UDP_FLOW_ACTION_PROXY, &listener);
     }
-    if (protocol == UDP_VALUE) watch_udp_release(config, cookie);
+    if (connected_udp) watch_udp_release(config, cookie);
     return rewrite_v4(ctx, &listener) ? 1 : 0;
 }
 
@@ -727,7 +729,7 @@ INLINE int handle_v6(
             flow_store(config, AF_INET_VALUE, protocol, port, flow_address, cookie,
                 SB_EBPF_UDP_FLOW_ACTION_PROXY, &listener);
         }
-        if (protocol == UDP_VALUE) watch_udp_release(config, cookie);
+        if (connected_udp) watch_udp_release(config, cookie);
         return rewrite_v4_mapped(ctx, &listener) ? 1 : 0;
     }
     if (!enable_native_ipv6) return 1;
@@ -788,7 +790,7 @@ INLINE int handle_v6(
         flow_store(config, AF_INET6_VALUE, protocol, port, flow_address, cookie,
             SB_EBPF_UDP_FLOW_ACTION_PROXY, &listener);
     }
-    if (protocol == UDP_VALUE) watch_udp_release(config, cookie);
+    if (connected_udp) watch_udp_release(config, cookie);
     return rewrite_v6(ctx, &listener) ? 1 : 0;
 }
 
@@ -909,7 +911,10 @@ INLINE int release_socket_notify(struct bpf_sock *ctx) {
         struct sb_ebpf_listener_key *listener = map_lookup(&cgroup_udp_token, &cookie);
         __u64 released_at_ns = flow_time_ns();
         // Notification is best-effort. A full ring only postpones userspace
-        // cleanup until the ordinary UDP deadline.
+        // cleanup until the ordinary UDP deadline. A watched socket whose token
+        // is gone (it reconnected to a destination that is not redirected, or
+        // its token passed to another socket) has nothing to report, which is
+        // not a dropped event.
         if (listener != 0) {
             // One checked lookup: verifiers through at least Linux 6.12 treat
             // every array lookup as nullable, so a second unchecked control()
@@ -927,10 +932,6 @@ INLINE int release_socket_notify(struct bpf_sock *ctx) {
                 __u64 *drops = map_lookup(&cgroup_udp_release_stats, &index);
                 if (drops != 0) *drops += 1U;
             }
-        } else {
-            __u32 index = 0U;
-            __u64 *drops = map_lookup(&cgroup_udp_release_stats, &index);
-            if (drops != 0) *drops += 1U;
         }
         return release_socket_cookie(cookie, released_at_ns);
     }
