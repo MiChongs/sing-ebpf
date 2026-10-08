@@ -187,7 +187,7 @@ INLINE bool initial_tcp_syn(
     if (protocol != IPPROTO_TCP_VALUE) return false;
     const struct tcp_header_min *tcp = (const void *)ports;
     if ((const void *)(tcp + 1) > data_end) return false;
-    __u16 flags = swap16(tcp->flags);
+    __u16 flags = network_order16(tcp->flags);
     if ((flags & TCP_FLAG_SYN) == 0U || (flags & TCP_FLAG_ACK) != 0U) return false;
     *sequence = tcp->sequence;
     return true;

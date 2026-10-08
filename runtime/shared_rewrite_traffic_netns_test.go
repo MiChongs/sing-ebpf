@@ -98,7 +98,7 @@ func TestSharedPacketRewriteCarriesTraffic(t *testing.T) {
 			}
 
 			exchangeSharedRewriteTCP(t, backend, client)
-			exchangeSharedRewriteUDP(t, client)
+			exchangeSharedRewriteUDP(t, router, client)
 
 			for name, read := range map[string]func() (uint64, error){
 				"rewrite failures":           backend.RewriteFailures,
@@ -214,7 +214,7 @@ func exchangeSharedRewriteTCP(t *testing.T, backend *commonEBPF.SharedPacketRewr
 	}
 }
 
-func exchangeSharedRewriteUDP(t *testing.T, client *testNetworkNamespaceWorker) {
+func exchangeSharedRewriteUDP(t *testing.T, router netlink.Link, client *testNetworkNamespaceWorker) {
 	t.Helper()
 	packetConn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: sharedRewriteTrafficListenerPort})
 	if err != nil {
@@ -236,7 +236,7 @@ func exchangeSharedRewriteUDP(t *testing.T, client *testNetworkNamespaceWorker) 
 	_ = conn.SetDeadline(deadline)
 	_ = packetConn.SetDeadline(deadline)
 
-	buffer := make([]byte, 2048)
+	buffer := make([]byte, pagedFrameMTU)
 	for index := range 8 {
 		message := bytes.Repeat([]byte{byte('a' + index)}, 64+index*100)
 		if _, err = conn.Write(message); err != nil {
@@ -263,6 +263,36 @@ func exchangeSharedRewriteUDP(t *testing.T, client *testNetworkNamespaceWorker) 
 		}
 		if !bytes.Equal(reply[:replyLength], message) {
 			t.Fatalf("reply %d payload differs", index)
+		}
+	}
+
+	// Raw frames from the client: ingress used to drop a datagram whose
+	// headers sit in page fragments, and to corrupt the absent checksum of
+	// a datagram sent without one, which the receiver then dropped.
+	for _, datagram := range []struct {
+		name        string
+		source      netip.AddrPort
+		length      int
+		checksummed bool
+	}{
+		{name: "headers in page fragments", source: netip.MustParseAddrPort("10.253.0.2:40001"), length: pagedFramePayloadLength, checksummed: true},
+		{name: "no checksum", source: netip.MustParseAddrPort("10.253.0.2:40002"), length: 512},
+	} {
+		payload := bytes.Repeat([]byte{'r'}, datagram.length)
+		_ = packetConn.SetDeadline(time.Now().Add(5 * time.Second))
+		sendPagedFrame(t, router, client, "sbsrw1", func(clientMAC net.HardwareAddr) []byte {
+			return buildEthernetIPv4UDP(router.Attrs().HardwareAddr, clientMAC, datagram.source,
+				sharedRewriteTrafficUDPDestination, payload, datagram.checksummed)
+		})
+		n, controlMessage, from, readErr := server.ReadFrom(buffer)
+		if readErr != nil {
+			t.Fatalf("receive the datagram with %s: %v", datagram.name, readErr)
+		}
+		token, _ := netip.AddrFromSlice(controlMessage.Dst.To4())
+		if !bytes.Equal(buffer[:n], payload) || !sharedRewriteTrafficTokenPrefix.Contains(token) ||
+			netip.MustParseAddrPort(from.String()) != datagram.source {
+			t.Fatalf("datagram with %s from %s to %s carried %d bytes, want %d bytes from %s to a token in %s",
+				datagram.name, from, token, n, len(payload), datagram.source, sharedRewriteTrafficTokenPrefix)
 		}
 	}
 }
