@@ -323,6 +323,34 @@ INLINE bool rewrite_v4_mapped(struct bpf_sock_addr *ctx, const struct sb_ebpf_li
     return true;
 }
 
+_Static_assert(__builtin_offsetof(struct sb_ebpf_udp_flow_key, family) % sizeof(__u32) == 0U &&
+        __builtin_offsetof(struct sb_ebpf_udp_flow_key, addr) -
+                __builtin_offsetof(struct sb_ebpf_udp_flow_key, family) ==
+            __builtin_offsetof(struct sb_ebpf_original_dst, addr) &&
+        __builtin_offsetof(struct sb_ebpf_original_dst, flags) == 20U,
+    "UDP flow key and original destination must share the destination layout");
+
+// A cached proxy decision holds only while the redirect entry it names still
+// records this socket's destination. Without socket-release support that map
+// is an LRU, and nothing else looks the entry up while the cache answers, so
+// the busiest flows would be evicted first and a later flow could claim the
+// token. The lookup also keeps the entry recently used.
+INLINE bool flow_redirect_current(
+    const struct sb_ebpf_udp_flow_key *key,
+    const struct sb_ebpf_listener_key *listener) {
+    const struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, listener);
+    if (original == 0 || original->socket_cookie != key->cookie) return false;
+    // family, protocol, port and address, then flags and reserved bytes, which
+    // are zero for the unconnected sends that this cache serves.
+    const __u32 *expected = (const __u32 *)&key->family;
+    const __u32 *actual = (const __u32 *)original;
+#pragma clang loop unroll(full)
+    for (__u32 index = 0U; index < 5U; ++index) {
+        if (expected[index] != actual[index]) return false;
+    }
+    return actual[5] == 0U;
+}
+
 INLINE int flow_action(
     struct bpf_sock_addr *ctx,
     const struct sb_ebpf_cgroup_control *config,
@@ -353,6 +381,10 @@ INLINE int flow_action(
     if (flow->last_seen_seconds != now) flow->last_seen_seconds = now;
     if (flow->action == SB_EBPF_UDP_FLOW_ACTION_BYPASS) return FLOW_CACHE_BYPASS;
     if (flow->action == SB_EBPF_UDP_FLOW_ACTION_PROXY) {
+        if (!flow_redirect_current(&flow_key, &flow->listener)) {
+            map_delete(&cgroup_udp_flow, &flow_key);
+            return FLOW_CACHE_MISS;
+        }
         if (mapped_context) rewrite_v4_mapped(ctx, &flow->listener);
         else if (family == AF_INET_VALUE) rewrite_v4(ctx, &flow->listener);
         else rewrite_v6(ctx, &flow->listener);
