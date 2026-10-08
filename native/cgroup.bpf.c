@@ -74,8 +74,25 @@ INLINE __u64 flow_time_ns(void) {
 #endif
 }
 
-INLINE __u16 swap16(__u16 value) { return __builtin_bswap16(value); }
-INLINE __u32 swap32(__u32 value) { return __builtin_bswap32(value); }
+// Host <-> network byte order. The same source is built for bpfel and bpfeb.
+INLINE __u16 network_order16(__u16 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap16(value);
+#else
+    return value;
+#endif
+}
+
+INLINE __u32 network_order32(__u32 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap32(value);
+#else
+    return value;
+#endif
+}
+
+// The third word of an IPv4-mapped IPv6 address, ::ffff:0:0/96.
+#define IPV4_MAPPED_WORD network_order32(0x0000ffffU)
 
 INLINE const struct sb_ebpf_cgroup_control *control(void) {
     __u32 key = 0U;
@@ -98,7 +115,7 @@ INLINE bool is_cookie_bypassed(__u64 cookie) {
 
 INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config) {
     if ((config->flags & SB_EBPF_CGROUP_FLAG_UID_POLICY) == 0U) return false;
-    __u32 uid = swap32((__u32)get_current_uid_gid());
+    __u32 uid = network_order32((__u32)get_current_uid_gid());
     struct sb_ebpf_uid_lpm_key key = {
         .prefixlen = 32U,
     };
@@ -127,7 +144,7 @@ INLINE bool port_bypassed(const struct sb_ebpf_cgroup_control *config, __u8 prot
 }
 
 INLINE bool ipv4_mapped(const __u32 address[4]) {
-    return address[0] == 0U && address[1] == 0U && swap32(address[2]) == 0xffffU;
+    return address[0] == 0U && address[1] == 0U && network_order32(address[2]) == 0x0000ffffU;
 }
 
 INLINE bool bypass_ipv4_cidr(__u32 address) {
@@ -222,7 +239,7 @@ INLINE bool token_v4(
     for (__u32 attempt = 0U; attempt < REDIRECT_TOKEN_ATTEMPTS; ++attempt) {
         __u32 candidate = config->redirect_ipv4_prefix |
             (seed & config->redirect_ipv4_host_mask);
-        __u32 network_candidate = swap32(candidate);
+        __u32 network_candidate = network_order32(candidate);
         __builtin_memset(key->token_addr, 0, sizeof(key->token_addr));
         __builtin_memcpy(key->token_addr, &network_candidate, sizeof(network_candidate));
         if (protocol == TCP_VALUE) {
@@ -279,7 +296,7 @@ INLINE bool rewrite_v4(struct bpf_sock_addr *ctx, const struct sb_ebpf_listener_
     __u32 address;
     __builtin_memcpy(&address, key->token_addr, sizeof(address));
     ctx->user_ip4 = address;
-    ctx->user_port = swap16(key->listener_port);
+    ctx->user_port = network_order16(key->listener_port);
     return true;
 }
 
@@ -291,7 +308,7 @@ INLINE bool rewrite_v6(struct bpf_sock_addr *ctx, const struct sb_ebpf_listener_
     *(volatile __u32 *)&ctx->user_ip6[1] = address[1];
     *(volatile __u32 *)&ctx->user_ip6[2] = address[2];
     *(volatile __u32 *)&ctx->user_ip6[3] = address[3];
-    ctx->user_port = swap16(key->listener_port);
+    ctx->user_port = network_order16(key->listener_port);
     return true;
 }
 
@@ -300,9 +317,9 @@ INLINE bool rewrite_v4_mapped(struct bpf_sock_addr *ctx, const struct sb_ebpf_li
     __builtin_memcpy(&address, key->token_addr, sizeof(address));
     *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
     *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
-    *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+    *(volatile __u32 *)&ctx->user_ip6[2] = IPV4_MAPPED_WORD;
     *(volatile __u32 *)&ctx->user_ip6[3] = address;
-    ctx->user_port = swap16(key->listener_port);
+    ctx->user_port = network_order16(key->listener_port);
     return true;
 }
 
@@ -485,7 +502,7 @@ INLINE bool restore_udp_peer_for_empty_v6(
     if (peer->family == AF_INET_VALUE) {
         address[0] = 0U;
         address[1] = 0U;
-        address[2] = 0xffff0000U;
+        address[2] = IPV4_MAPPED_WORD;
         __builtin_memcpy(&address[3], peer->addr, sizeof(address[3]));
     } else if (peer->family == AF_INET6_VALUE) {
         __builtin_memcpy(address, peer->addr, sizeof(peer->addr));
@@ -513,7 +530,7 @@ INLINE int handle_v4(
         protocol = connect_hook ? ctx->protocol : UDP_VALUE;
     }
     if (!protocol_selected(config, protocol)) return 1;
-    __u16 port = swap16((__u16)ctx->user_port);
+    __u16 port = network_order16((__u16)ctx->user_port);
     __u64 cookie = get_socket_cookie(ctx);
     if (is_cookie_bypassed(cookie)) return 1;
     __u32 destination = ctx->user_ip4;
@@ -607,7 +624,7 @@ INLINE int handle_v6(
         protocol = connect_hook ? ctx->protocol : UDP_VALUE;
     }
     if (!protocol_selected(config, protocol)) return 1;
-    __u16 port = swap16((__u16)ctx->user_port);
+    __u16 port = network_order16((__u16)ctx->user_port);
     __u64 cookie = get_socket_cookie(ctx);
     if (is_cookie_bypassed(cookie)) return 1;
     bool missing_destination =
@@ -761,16 +778,16 @@ INLINE int recv_v4(struct bpf_sock_addr *ctx) {
     if (config == 0) return 1;
     __u32 destination = ctx->user_ip4;
     if ((config->flags & SB_EBPF_CGROUP_FLAG_IPV4) == 0U) return 1;
-    if ((swap32(destination) & ~config->redirect_ipv4_host_mask) != config->redirect_ipv4_prefix) return 1;
+    if ((network_order32(destination) & ~config->redirect_ipv4_host_mask) != config->redirect_ipv4_prefix) return 1;
     struct sb_ebpf_listener_key key = {.family = AF_INET_VALUE, .protocol = UDP_VALUE,
-        .listener_port = swap16((__u16)ctx->user_port)};
+        .listener_port = network_order16((__u16)ctx->user_port)};
     __builtin_memcpy(key.token_addr, &destination, sizeof(destination));
     struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, &key);
     if (original == 0 || original->family != AF_INET_VALUE) return 1;
     __u32 address;
     __builtin_memcpy(&address, original->addr, sizeof(address));
     ctx->user_ip4 = address;
-    ctx->user_port = swap16(original->port);
+    ctx->user_port = network_order16(original->port);
     return 1;
 }
 
@@ -783,9 +800,9 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx, bool enable_native_ipv6) {
         if ((config->flags & SB_EBPF_CGROUP_FLAG_IPV4) == 0U) return 1;
         __u32 v4;
         __builtin_memcpy(&v4, ((__u8 *)address) + 12U, sizeof(v4));
-        if ((swap32(v4) & ~config->redirect_ipv4_host_mask) != config->redirect_ipv4_prefix) return 1;
+        if ((network_order32(v4) & ~config->redirect_ipv4_host_mask) != config->redirect_ipv4_prefix) return 1;
         struct sb_ebpf_listener_key key = {.family = AF_INET_VALUE, .protocol = UDP_VALUE,
-            .listener_port = swap16((__u16)ctx->user_port)};
+            .listener_port = network_order16((__u16)ctx->user_port)};
         __builtin_memcpy(key.token_addr, &v4, sizeof(v4));
         struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, &key);
         if (original == 0 || original->family != AF_INET_VALUE) return 1;
@@ -793,9 +810,9 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx, bool enable_native_ipv6) {
         __builtin_memcpy(&original_address, original->addr, sizeof(original_address));
         *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
         *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
-        *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+        *(volatile __u32 *)&ctx->user_ip6[2] = IPV4_MAPPED_WORD;
         *(volatile __u32 *)&ctx->user_ip6[3] = original_address;
-        ctx->user_port = swap16(original->port);
+        ctx->user_port = network_order16(original->port);
         return 1;
     }
     if (!enable_native_ipv6) return 1;
@@ -804,7 +821,7 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx, bool enable_native_ipv6) {
     __builtin_memcpy(redirect_prefix, config->redirect_ipv6_prefix, sizeof(redirect_prefix));
     if (address[0] != redirect_prefix[0] || address[1] != redirect_prefix[1]) return 1;
     struct sb_ebpf_listener_key key = {.family = AF_INET6_VALUE, .protocol = UDP_VALUE,
-        .listener_port = swap16((__u16)ctx->user_port)};
+        .listener_port = network_order16((__u16)ctx->user_port)};
     __builtin_memcpy(key.token_addr, address, sizeof(key.token_addr));
     struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, &key);
     if (original == 0 || original->family != AF_INET6_VALUE) return 1;
@@ -814,7 +831,7 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx, bool enable_native_ipv6) {
     *(volatile __u32 *)&ctx->user_ip6[1] = original_address[1];
     *(volatile __u32 *)&ctx->user_ip6[2] = original_address[2];
     *(volatile __u32 *)&ctx->user_ip6[3] = original_address[3];
-    ctx->user_port = swap16(original->port);
+    ctx->user_port = network_order16(original->port);
     return 1;
 }
 

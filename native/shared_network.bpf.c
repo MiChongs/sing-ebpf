@@ -109,12 +109,21 @@ INLINE void refresh_activity_timestamp(__u64 *last_seen_ns, __u64 now) {
     }
 }
 
-INLINE __u16 swap16(__u16 value) {
+// Host <-> network byte order. The same source is built for bpfel and bpfeb.
+INLINE __u16 network_order16(__u16 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     return __builtin_bswap16(value);
+#else
+    return value;
+#endif
 }
 
-INLINE __u32 swap32(__u32 value) {
+INLINE __u32 network_order32(__u32 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     return __builtin_bswap32(value);
+#else
+    return value;
+#endif
 }
 
 INLINE void copy_address(__u8 destination[16], const __u8 source[16], __u32 size) {
@@ -149,7 +158,7 @@ NOINLINE int ingress_ipv4(
     struct ipv4_header *ip = data + l3_offset;
     if ((void *)(ip + 1) > data_end || ip->version != 4U || ip->ihl < 5U) return shared_ingress_pass();
     if (!selected_protocol(ip->protocol, control)) return shared_ingress_pass();
-    __u16 fragment = swap16(ip->fragment_offset);
+    __u16 fragment = network_order16(ip->fragment_offset);
     if ((fragment & (IPV4_FRAGMENT_OFFSET_MASK | IPV4_FRAGMENT_MORE)) != 0U) {
         return shared_ingress_fragment_pass();
     }
@@ -162,8 +171,8 @@ NOINLINE int ingress_ipv4(
     __u8 protocol = ip->protocol;
     __be32 original_address = ip->destination;
     __be16 destination_port_raw = ports->destination;
-    __u16 source_port = swap16(ports->source);
-    __u16 destination_port = swap16(destination_port_raw);
+    __u16 source_port = network_order16(ports->source);
+    __u16 destination_port = network_order16(destination_port_raw);
     __builtin_memset(&scratch->original, 0, sizeof(scratch->original));
     scratch->original.ifindex = skb->ifindex;
     scratch->original.family = AF_INET_VALUE;
@@ -242,7 +251,7 @@ NOINLINE int ingress_ipv4(
         original_address,
         token_address,
         destination_port_raw,
-        swap16(control->listener_port),
+        network_order16(control->listener_port),
         protocol);
 }
 
@@ -256,7 +265,7 @@ NOINLINE int egress_ipv4(
     if ((void *)(ip + 1) > data_end || ip->version != 4U || ip->ihl < 5U) return shared_egress_pass();
     if (!ipv4_token_address(ip->source, control)) return shared_egress_pass();
     if (!selected_protocol(ip->protocol, control)) return TC_ACT_SHOT;
-    __u16 fragment = swap16(ip->fragment_offset);
+    __u16 fragment = network_order16(ip->fragment_offset);
     if ((fragment & (IPV4_FRAGMENT_OFFSET_MASK | IPV4_FRAGMENT_MORE)) != 0U) {
         return shared_egress_fragment_pass();
     }
@@ -267,14 +276,14 @@ NOINLINE int egress_ipv4(
     struct transport_ports *ports = (void *)ip + header_length;
     if ((void *)(ports + 1) > data_end) return TC_ACT_SHOT;
     __be16 source_port_raw = ports->source;
-    if (swap16(source_port_raw) != control->listener_port) return shared_egress_pass();
+    if (network_order16(source_port_raw) != control->listener_port) return shared_egress_pass();
     __u8 protocol = ip->protocol;
     __be32 token_address = ip->source;
 
     __builtin_memset(&scratch->listener_key, 0, sizeof(scratch->listener_key));
     scratch->listener_key.family = AF_INET_VALUE;
     scratch->listener_key.protocol = protocol;
-    scratch->listener_key.client_port = swap16(ports->destination);
+    scratch->listener_key.client_port = network_order16(ports->destination);
     scratch->listener_key.listener_port = control->listener_port;
     __builtin_memcpy(scratch->listener_key.client_addr, &ip->destination, 4U);
     __builtin_memcpy(scratch->listener_key.token_addr, &token_address, 4U);
@@ -295,7 +304,7 @@ NOINLINE int egress_ipv4(
         token_address,
         original_address,
         source_port_raw,
-        swap16(scratch->original_value.port),
+        network_order16(scratch->original_value.port),
         protocol);
 }
 
@@ -322,7 +331,7 @@ NOINLINE __u64 ipv6_transport_offset(
                 continue;
             }
             protocol = fragment->next_header;
-            __u16 fragment_offset = swap16(fragment->fragment_offset);
+            __u16 fragment_offset = network_order16(fragment->fragment_offset);
             if ((fragment_offset & (IPV6_FRAGMENT_OFFSET_MASK | IPV6_FRAGMENT_MORE)) != 0U) {
                 result = IPV6_TRANSPORT_FRAGMENT;
                 continue;
@@ -367,7 +376,7 @@ NOINLINE int ingress_ipv6(
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
     struct ipv6_header *ip = data + l3_offset;
-    if ((void *)(ip + 1) > data_end || (swap32(ip->version_flow) >> 28U) != 6U) return shared_ingress_pass();
+    if ((void *)(ip + 1) > data_end || (network_order32(ip->version_flow) >> 28U) != 6U) return shared_ingress_pass();
     __u8 protocol = 0U;
     __u64 transport_result = ipv6_transport_offset(
         data,
@@ -391,8 +400,8 @@ NOINLINE int ingress_ipv6(
     if ((void *)(ports + 1) > data_end) return TC_ACT_SHOT;
     __be16 source_port_raw = ports->source;
     __be16 destination_port_raw = ports->destination;
-    __u16 source_port = swap16(source_port_raw);
-    __u16 destination_port = swap16(destination_port_raw);
+    __u16 source_port = network_order16(source_port_raw);
+    __u16 destination_port = network_order16(destination_port_raw);
     __builtin_memset(&scratch->original, 0, sizeof(scratch->original));
     scratch->original.ifindex = skb->ifindex;
     scratch->original.family = AF_INET6_VALUE;
@@ -470,7 +479,7 @@ NOINLINE int ingress_ipv6(
         scratch->original.original_addr,
         scratch->token.token_addr,
         destination_port_raw,
-        swap16(control->listener_port),
+        network_order16(control->listener_port),
         protocol);
 }
 
@@ -481,7 +490,7 @@ NOINLINE int egress_ipv6(
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
     struct ipv6_header *ip = data + l3_offset;
-    if ((void *)(ip + 1) > data_end || (swap32(ip->version_flow) >> 28U) != 6U) return shared_egress_pass();
+    if ((void *)(ip + 1) > data_end || (network_order32(ip->version_flow) >> 28U) != 6U) return shared_egress_pass();
     if (!ipv6_token_address(ip->source, control)) return shared_egress_pass();
     __u8 protocol = 0U;
     __u64 transport_result = ipv6_transport_offset(
@@ -504,13 +513,13 @@ NOINLINE int egress_ipv6(
     struct transport_ports *ports = data + transport;
     if ((void *)(ports + 1) > data_end) return TC_ACT_SHOT;
     __be16 source_port_raw = ports->source;
-    if (swap16(source_port_raw) != control->listener_port) return shared_egress_pass();
+    if (network_order16(source_port_raw) != control->listener_port) return shared_egress_pass();
     __be16 destination_port_raw = ports->destination;
 
     __builtin_memset(&scratch->listener_key, 0, sizeof(scratch->listener_key));
     scratch->listener_key.family = AF_INET6_VALUE;
     scratch->listener_key.protocol = protocol;
-    scratch->listener_key.client_port = swap16(destination_port_raw);
+    scratch->listener_key.client_port = network_order16(destination_port_raw);
     scratch->listener_key.listener_port = control->listener_port;
     copy_address(scratch->listener_key.client_addr, ip->destination, 16U);
     copy_address(scratch->listener_key.token_addr, ip->source, 16U);
@@ -529,7 +538,7 @@ NOINLINE int egress_ipv6(
         scratch->listener_key.token_addr,
         scratch->original_value.addr,
         source_port_raw,
-        swap16(scratch->original_value.port),
+        network_order16(scratch->original_value.port),
         protocol);
 }
 
@@ -541,14 +550,14 @@ NOINLINE int classify_ingress(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
     struct ethernet_header *ethernet = data;
     if ((void *)(ethernet + 1) > data_end) return shared_ingress_pass();
-    __u16 protocol = swap16(ethernet->protocol);
+    __u16 protocol = network_order16(ethernet->protocol);
     __u32 l3_offset = sizeof(*ethernet);
 #pragma clang loop unroll(full)
     for (__u32 depth = 0U; depth < 2U; ++depth) {
         if (protocol != ETH_P_8021Q_VALUE && protocol != ETH_P_8021AD_VALUE) break;
         struct vlan_header *vlan = data + l3_offset;
         if ((void *)(vlan + 1) > data_end) return shared_ingress_pass();
-        protocol = swap16(vlan->protocol);
+        protocol = network_order16(vlan->protocol);
         l3_offset += sizeof(*vlan);
     }
     __u32 source_mac_first;
@@ -572,14 +581,14 @@ NOINLINE int classify_egress(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
     struct ethernet_header *ethernet = data;
     if ((void *)(ethernet + 1) > data_end) return shared_egress_pass();
-    __u16 protocol = swap16(ethernet->protocol);
+    __u16 protocol = network_order16(ethernet->protocol);
     __u32 l3_offset = sizeof(*ethernet);
 #pragma clang loop unroll(full)
     for (__u32 depth = 0U; depth < 2U; ++depth) {
         if (protocol != ETH_P_8021Q_VALUE && protocol != ETH_P_8021AD_VALUE) break;
         struct vlan_header *vlan = data + l3_offset;
         if ((void *)(vlan + 1) > data_end) return shared_egress_pass();
-        protocol = swap16(vlan->protocol);
+        protocol = network_order16(vlan->protocol);
         l3_offset += sizeof(*vlan);
     }
     if (protocol == ETH_P_IP_VALUE && (control->flags & SB_SHARED_FLAG_IPV4) != 0U) {

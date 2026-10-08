@@ -87,7 +87,7 @@ INLINE int rewrite_ipv6(
 }
 
 INLINE bool ipv4_token_address(__be32 address, const struct sb_shared_control *control) {
-    __u32 host = swap32(address);
+    __u32 host = network_order32(address);
     __u32 prefix = ((__u32)control->token_ipv4_prefix[0] << 24U) |
         ((__u32)control->token_ipv4_prefix[1] << 16U) |
         ((__u32)control->token_ipv4_prefix[2] << 8U) |
