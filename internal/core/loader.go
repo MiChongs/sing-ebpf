@@ -109,12 +109,14 @@ const (
 	cgroupAttachModeNetdReplace = "legacy_netd_replace"
 )
 
-func attachProgramRaw(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (*displacedCgroupOwner, error) {
-	attachment, err := attachProgramRawWithMode(target, program, attachType)
-	if err != nil {
-		return nil, err
-	}
-	return attachment.displaced, nil
+// attachProgramRaw is the legacy attach of optional components. It never
+// displaces an existing owner, not even a pass-through one: a program of
+// theirs in netd's place would be an owner that does real work, which the
+// interception backend would then have to refuse, while the component itself
+// has a userspace fallback.
+func attachProgramRaw(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
+	_, err := attachProgramRawWithMode(target, program, attachType, false)
+	return err
 }
 
 // attachProgramRawMultiOnly is used for optional capability probes and for
@@ -138,7 +140,17 @@ func attachProgramRawMultiOnly(target int, program *CiliumEBPF.Program, attachTy
 // vendor kernel can reject BPF_F_ALLOW_MULTI while still accepting the
 // single-program legacy operation. Callers must expose the effective path,
 // not merely the attempted fast path.
-func attachProgramRawWithMode(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (legacyCgroupAttachment, error) {
+//
+// replacePassThrough lets the attach replace a pass-through owner, such as the
+// placeholder Android 15+ netd keeps on the root socket-address hooks (see
+// cgroup_netd.go). Only the interception backend sets it: it has no fallback,
+// and it restores the displaced owner on detach.
+func attachProgramRawWithMode(
+	target int,
+	program *CiliumEBPF.Program,
+	attachType CiliumEBPF.AttachType,
+	replacePassThrough bool,
+) (legacyCgroupAttachment, error) {
 	options := link.RawAttachProgramOptions{
 		Target:  target,
 		Program: program,
@@ -154,15 +166,19 @@ func attachProgramRawWithMode(target int, program *CiliumEBPF.Program, attachTyp
 	}
 	// An unflagged legacy attach replaces the current exclusive owner. The one
 	// owner that is replaced is a pass-through, such as the placeholder
-	// Android 15+ netd keeps on the root socket-address hooks; it is held open
-	// and restored on detach (see cgroup_netd.go). Any owner that does real
-	// work is left alone. Optional components fall
-	// back to userspace; the interception backend has no such fallback and
-	// reports ErrCgroupHookOccupied, naming the current owners so the
-	// operator can tell a foreign program from a stale one of ours. Kernels
-	// without BPF_PROG_QUERY retain the historical fallback because there is
-	// no safe way to distinguish an empty hook from an unqueryable one.
+	// Android 15+ netd keeps on the root socket-address hooks, and only when
+	// replacePassThrough is set; it is held open and restored on detach (see
+	// cgroup_netd.go). Any owner that does real work is left alone. Optional
+	// components fall back to userspace; the interception backend has no such
+	// fallback and reports ErrCgroupHookOccupied, naming the current owners so
+	// the operator can tell a foreign program from a stale one of ours.
+	// Kernels without BPF_PROG_QUERY retain the historical fallback because
+	// there is no safe way to distinguish an empty hook from an unqueryable
+	// one.
 	if result, queryErr := queryCgroupPrograms(link.QueryOptions{Target: target, Attach: attachType}); queryErr == nil && len(result.Programs) > 0 {
+		if !replacePassThrough {
+			return legacyCgroupAttachment{}, newCgroupHookOccupiedError(attachType, result.Programs, nil)
+		}
 		displaced, keptReason := displaceableCgroupOwner(target, attachType, result.Programs)
 		if displaced == nil {
 			return legacyCgroupAttachment{}, newCgroupHookOccupiedError(attachType, result.Programs, keptReason)

@@ -101,11 +101,10 @@ func attachCgroupProgramWithPolicy(
 		_ = cgroupFile.Close()
 		return nil, linkErr
 	}
-	var displaced *displacedCgroupOwner
 	if policy == cgroupAttachMultiOnly {
 		err = attachProgramRawMultiOnly(int(cgroupFile.Fd()), program, attachType)
 	} else {
-		displaced, err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType)
+		err = attachProgramRaw(int(cgroupFile.Fd()), program, attachType)
 	}
 	if err != nil {
 		_ = cgroupFile.Close()
@@ -115,7 +114,6 @@ func attachCgroupProgramWithPolicy(
 		cgroupFile: cgroupFile,
 		program:    program,
 		attachType: attachType,
-		displaced:  displaced,
 	}, nil
 }
 
@@ -123,9 +121,6 @@ type legacyCgroupProgramLink struct {
 	cgroupFile *os.File
 	program    *CiliumEBPF.Program
 	attachType CiliumEBPF.AttachType
-	// displaced is the netd placeholder this attachment replaced, if any. It
-	// goes back on the hook when the attachment is closed.
-	displaced *displacedCgroupOwner
 	// detachProgram is nil in production. Tests inject a transient detach
 	// failure to prove that the target FD remains owned for a cleanup retry.
 	detachProgram func(int, *CiliumEBPF.Program, CiliumEBPF.AttachType) error
@@ -135,20 +130,13 @@ func (l *legacyCgroupProgramLink) Close() error {
 	if l == nil || l.cgroupFile == nil {
 		return nil
 	}
-	if l.displaced != nil {
-		if err := restoreDisplacedCgroupOwner(int(l.cgroupFile.Fd()), l.program, l.displaced, l.attachType); err != nil {
-			return err
-		}
-		l.displaced = nil
-	} else {
-		detachProgram := l.detachProgram
-		if detachProgram == nil {
-			detachProgram = rawDetachProgram
-		}
-		detachErr := detachProgram(int(l.cgroupFile.Fd()), l.program, l.attachType)
-		if detachErr != nil && !errors.Is(detachErr, unix.ENOENT) && !errors.Is(detachErr, unix.ESRCH) {
-			return detachErr
-		}
+	detachProgram := l.detachProgram
+	if detachProgram == nil {
+		detachProgram = rawDetachProgram
+	}
+	detachErr := detachProgram(int(l.cgroupFile.Fd()), l.program, l.attachType)
+	if detachErr != nil && !errors.Is(detachErr, unix.ENOENT) && !errors.Is(detachErr, unix.ESRCH) {
+		return detachErr
 	}
 	closeErr := l.cgroupFile.Close()
 	l.cgroupFile = nil
@@ -532,7 +520,7 @@ func (b *CgroupBackend) Attach() error {
 			b.runtime.attach_modes[slot] = cgroupAttachModeLinkCreate
 		} else if cgroupLinkUnavailable(err) {
 			var attachment legacyCgroupAttachment
-			attachment, err = attachProgramRawWithMode(cgroupFD, program, cgroupProgramDefinitions[slot].attachType)
+			attachment, err = attachProgramRawWithMode(cgroupFD, program, cgroupProgramDefinitions[slot].attachType, true)
 			if err == nil {
 				b.runtime.attach_modes[slot] = attachment.mode
 				b.runtime.displaced[slot] = attachment.displaced

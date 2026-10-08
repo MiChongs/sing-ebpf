@@ -141,13 +141,15 @@ fall back to an unflagged attach that could replace an existing cgroup owner.
 The ordinary cgroup hook attach may still use the legacy-exclusive fallback
 after querying for an existing owner, but only for the interception backend
 (which has no other fallback) and the self-bypass hooks in an exclusive process
-cgroup. The only existing owner it replaces is a pass-through recognized in
-`cgroup_netd.go`: the lone owner of a hook in single-program or override mode
-whose translated instructions reduce to `r0 = 1; exit`. Names, BTF and pins
-vary across netd builds and are consulted only when the kernel withholds the
-instructions. The replacement and the restore use the hook's own flags, so the
-hook never leaves the mode netd's restart path requires. The displaced program
-is kept open and put back by the same code that detaches ours. Startup reclaim
+cgroup. The only existing owner it replaces, and only for the interception
+backend, is a pass-through recognized in `cgroup_netd.go`: the lone owner of a
+hook in single-program or override mode whose translated instructions reduce to
+`r0 = 1; exit`. Names, BTF and pins vary across netd builds and are consulted
+only when the kernel withholds the instructions. The replacement and the
+restore use the hook's own flags, so the hook never leaves the mode netd's
+restart path requires. The displaced program is kept open and put back by the
+same code that detaches ours. Optional components, the self-bypass hooks
+included, never replace an owner. Startup reclaim
 of a stale takeover on a netd device swaps in netd's pin or an `sb_hook_allow`
 pass-through rather than emptying the hook. Optional components that share a cgroup with the interception backend,
 such as the process tracker on the cgroup v2 root, use

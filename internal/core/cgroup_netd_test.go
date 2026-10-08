@@ -87,7 +87,7 @@ func passThroughOwner33(_ CiliumEBPF.AttachType, ownerID CiliumEBPF.ProgramID, f
 func TestRawCgroupAttachReplacesPassThroughOwner(t *testing.T) {
 	for _, hookFlags := range []uint32{0, unix.BPF_F_ALLOW_OVERRIDE} {
 		fixture := installNetdAttachFixture(t, []link.AttachedProgram{{ID: 33}}, hookFlags, passThroughOwner33)
-		attachment, err := attachProgramRawWithMode(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+		attachment, err := attachProgramRawWithMode(42, nil, CiliumEBPF.AttachCGroupInet4Connect, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,6 +100,25 @@ func TestRawCgroupAttachReplacesPassThroughOwner(t *testing.T) {
 		if !slices.Equal(fixture.flags, []uint32{unix.BPF_F_ALLOW_MULTI, hookFlags}) {
 			t.Fatalf("flags=%v, want the multi attempt and then a replacement with %#x", fixture.flags, hookFlags)
 		}
+	}
+}
+
+// Only the interception backend takes a hook over. An optional component's
+// legacy attach keeps even a pass-through owner and falls back to userspace.
+func TestRawCgroupAttachOfOptionalComponentKeepsPassThroughOwner(t *testing.T) {
+	fixture := installNetdAttachFixture(t, []link.AttachedProgram{{ID: 33}}, 0, passThroughOwner33)
+	err := attachProgramRaw(42, nil, CiliumEBPF.AttachCGroupInet4Connect)
+	if !errors.Is(err, ErrCgroupHookOccupied) {
+		t.Fatalf("error = %v, want ErrCgroupHookOccupied", err)
+	}
+	if !strings.Contains(err.Error(), "id=33 name=connect4_inet4_connect_4_19_v") {
+		t.Fatalf("error %q does not name the owner", err)
+	}
+	if fixture.ownerCalls != 0 {
+		t.Fatalf("owner inspected %d times, want none", fixture.ownerCalls)
+	}
+	if !slices.Equal(fixture.flags, []uint32{unix.BPF_F_ALLOW_MULTI}) {
+		t.Fatalf("flags=%v, want only the non-destructive multi attach", fixture.flags)
 	}
 }
 
@@ -139,7 +158,7 @@ func TestRawCgroupAttachKeepsOwnersThatAreNotPassThrough(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := installNetdAttachFixture(t, testCase.owners, testCase.hookFlags, passThroughOwner33)
-			_, err := attachProgramRawWithMode(42, nil, testCase.attachType)
+			_, err := attachProgramRawWithMode(42, nil, testCase.attachType, true)
 			if !errors.Is(err, ErrCgroupHookOccupied) {
 				t.Fatalf("error = %v, want ErrCgroupHookOccupied", err)
 			}
@@ -210,55 +229,57 @@ func TestRestoreDisplacedCgroupOwner(t *testing.T) {
 	}
 }
 
-func TestRestoreDisplacedCgroupOwnerKeepsOwnerForRetry(t *testing.T) {
+// newDisplacedOwnerTestBackend is a backend whose connect4 attachment replaced
+// netd's placeholder, program 33.
+func newDisplacedOwnerTestBackend(t *testing.T) *CgroupBackend {
+	t.Helper()
+	cgroupFile, err := os.Create(filepath.Join(t.TempDir(), "cgroup"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cgroupFile.Close() })
+	backend := &CgroupBackend{runtime: &cgroupRuntime{
+		cgroupFile: cgroupFile,
+		programs:   make([]*CiliumEBPF.Program, cgroupProgramCount),
+	}}
+	backend.runtime.attached[0] = true
+	backend.runtime.attach_modes[0] = cgroupAttachModeNetdReplace
+	backend.runtime.displaced[0] = &displacedCgroupOwner{id: 33}
+	return backend
+}
+
+func TestCgroupBackendDetachKeepsDisplacedOwnerForRetry(t *testing.T) {
 	installNetdAttachFixture(t, []link.AttachedProgram{{ID: 7}}, 0, passThroughOwner33)
 	originalProgramHasID := programHasID
 	t.Cleanup(func() { programHasID = originalProgramHasID })
 	programHasID = func(*CiliumEBPF.Program, CiliumEBPF.ProgramID) bool { return true }
 	rawAttachProgram = func(link.RawAttachProgramOptions) error { return unix.EBUSY }
-	cgroupFile, err := os.Create(filepath.Join(t.TempDir(), "cgroup"))
-	if err != nil {
-		t.Fatal(err)
+	backend := newDisplacedOwnerTestBackend(t)
+	if err := backend.detachProgramsLocked(); !errors.Is(err, unix.EBUSY) {
+		t.Fatalf("detach error = %v, want EBUSY", err)
 	}
-	programLink := &legacyCgroupProgramLink{
-		cgroupFile: cgroupFile,
-		attachType: CiliumEBPF.AttachCGroupInet4Connect,
-		displaced:  &displacedCgroupOwner{id: 33},
-	}
-	if err = programLink.Close(); !errors.Is(err, unix.EBUSY) {
-		t.Fatalf("close error = %v, want EBUSY", err)
-	}
-	if programLink.IsClosed() || programLink.displaced == nil {
+	if !backend.runtime.attached[0] || backend.runtime.displaced[0] == nil {
 		t.Fatal("a failed restore discarded the displaced owner instead of keeping it for a retry")
 	}
 }
 
-func TestLegacyCgroupProgramLinkRestoresDisplacedOwner(t *testing.T) {
+func TestCgroupBackendDetachRestoresDisplacedOwner(t *testing.T) {
 	fixture := installNetdAttachFixture(t, []link.AttachedProgram{{ID: 7}}, 0, passThroughOwner33)
 	originalProgramHasID := programHasID
 	t.Cleanup(func() { programHasID = originalProgramHasID })
 	programHasID = func(*CiliumEBPF.Program, CiliumEBPF.ProgramID) bool { return true }
-	cgroupFile, err := os.Create(filepath.Join(t.TempDir(), "cgroup"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	programLink := &legacyCgroupProgramLink{
-		cgroupFile: cgroupFile,
-		attachType: CiliumEBPF.AttachCGroupInet4Connect,
-		displaced:  &displacedCgroupOwner{id: 33},
-		detachProgram: func(int, *CiliumEBPF.Program, CiliumEBPF.AttachType) error {
-			t.Fatal("a detach would leave the netd hook empty instead of restored")
-			return nil
-		},
-	}
-	if err = programLink.Close(); err != nil {
+	backend := newDisplacedOwnerTestBackend(t)
+	if err := backend.detachProgramsLocked(); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(fixture.flags, []uint32{0}) {
 		t.Fatalf("attach flags = %v, want one unflagged restore", fixture.flags)
 	}
-	if !programLink.IsClosed() {
-		t.Fatal("legacy cgroup target remained open after restoring the owner")
+	if fixture.detached != 0 {
+		t.Fatalf("detached %d times; a detach would leave the netd hook empty instead of restored", fixture.detached)
+	}
+	if backend.runtime.attached[0] || backend.runtime.displaced[0] != nil {
+		t.Fatal("the restored attachment is still recorded")
 	}
 }
 
