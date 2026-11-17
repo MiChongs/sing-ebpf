@@ -4,6 +4,7 @@ package runtime
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -12,6 +13,7 @@ import (
 	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/netlink"
 	E "github.com/sagernet/sing/common/exceptions"
+	"golang.org/x/sys/unix"
 )
 
 // newTCDeliveryHardwareAddress returns a random locally administered unicast
@@ -72,6 +74,11 @@ func nextTCVethNames() (string, string, error) {
 // tcNamespaceTimeWaitPath bounds TIME_WAIT sockets of the namespace that runs
 // it; within a private socket-assignment namespace it is that namespace's own.
 const tcNamespaceTimeWaitPath = "/proc/sys/net/ipv4/tcp_max_tw_buckets"
+
+func tcOptionalSysctlUnavailable(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, os.ErrInvalid) || errors.Is(err, unix.EROFS)
+}
 
 func tcInterfaceSysctlPath(interfaceName, setting string) string {
 	return "/proc/sys/net/ipv4/conf/" + interfaceName + "/" + setting

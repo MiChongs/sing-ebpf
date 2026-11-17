@@ -16,7 +16,8 @@ import (
 func newTestAssignmentBackend(t *testing.T) *TCBackend {
 	t.Helper()
 	assignmentMap, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
-		Type:       CiliumEBPF.LRUHash,
+		Type:       CiliumEBPF.Hash,
+		Flags:      bpfFlagNoPrealloc,
 		KeySize:    uint32(unsafe.Sizeof(tcAssignKey{})),
 		ValueSize:  uint32(unsafe.Sizeof(TCAssignment{})),
 		MaxEntries: 64,
@@ -27,6 +28,15 @@ func newTestAssignmentBackend(t *testing.T) *TCBackend {
 	t.Cleanup(func() { _ = assignmentMap.Close() })
 	backend := &TCBackend{}
 	backend.runtime = &tcRuntime{maps: map[string]*CiliumEBPF.Map{"tc_assignment": assignmentMap}}
+	claimMap, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Type: CiliumEBPF.Hash, Flags: bpfFlagNoPrealloc,
+		KeySize: uint32(unsafe.Sizeof(tcAssignKey{})), ValueSize: uint32(unsafe.Sizeof(tcAssignmentClaim{})), MaxEntries: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = claimMap.Close() })
+	backend.runtime.maps["tc_assignment_claim"] = claimMap
 	returnMap, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
 		Type: CiliumEBPF.Hash, KeySize: uint32(unsafe.Sizeof(tcAssignKey{})),
 		ValueSize: uint32(unsafe.Sizeof(tcReturnValue{})), MaxEntries: 64,
@@ -36,7 +46,7 @@ func newTestAssignmentBackend(t *testing.T) *TCBackend {
 	}
 	t.Cleanup(func() { _ = returnMap.Close() })
 	backend.runtime.maps["tc_return"] = returnMap
-	backend.assignmentMapFD = assignmentMap.FD()
+	backend.flowStore.assignment.mapFD = assignmentMap.FD()
 	return backend
 }
 
@@ -56,7 +66,7 @@ func writeTestAssignment(
 	if err != nil {
 		t.Fatalf("build the assignment key: %v", err)
 	}
-	if err = updateMap(backend.assignmentMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+	if err = updateMap(backend.flowStore.assignment.mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
 		t.Fatalf("write the assignment: %v", err)
 	}
 }
@@ -216,9 +226,9 @@ func TestRemoveAssignmentIfMatchFollowsActivityRefresh(t *testing.T) {
 	}
 }
 
-func TestSweepAssignmentsRemovesOnlyUnchangedStaleEntries(t *testing.T) {
+func TestSweepFlowsRemovesOnlyUnchangedStaleEntries(t *testing.T) {
 	backend := newTestAssignmentBackend(t)
-	backend.assignmentCapacity = 64
+	backend.flowStore.assignment.capacity = 64
 	source := netip.MustParseAddrPort("192.0.2.10:53000")
 	destination := netip.MustParseAddrPort("1.1.1.1:53")
 	key, err := makeTCAssignKey(ProtocolUDP, source, destination, 17)
@@ -238,11 +248,11 @@ func TestSweepAssignmentsRemovesOnlyUnchangedStaleEntries(t *testing.T) {
 		time.Sleep(2*time.Second - time.Duration(now) + time.Millisecond)
 	}
 	value.LastSeenNS = 1
-	if err = updateMap(backend.assignmentMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+	if err = updateMap(backend.flowStore.assignment.mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
 		t.Fatal(err)
 	}
 
-	result, err := backend.SweepAssignments(time.Second, 64)
+	result, err := backend.SweepFlows(time.Second, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,9 +264,9 @@ func TestSweepAssignmentsRemovesOnlyUnchangedStaleEntries(t *testing.T) {
 	}
 }
 
-func TestSweepAssignmentsPreservesCoalescedActivity(t *testing.T) {
+func TestSweepFlowsPreservesCoalescedActivity(t *testing.T) {
 	backend := newTestAssignmentBackend(t)
-	backend.assignmentCapacity = 64
+	backend.flowStore.assignment.capacity = 64
 	source := netip.MustParseAddrPort("192.0.2.10:53000")
 	destination := netip.MustParseAddrPort("1.1.1.1:53")
 	now := monotonicNowNS()
@@ -273,7 +283,7 @@ func TestSweepAssignmentsPreservesCoalescedActivity(t *testing.T) {
 
 	// A caller's subsecond timeout must not mistake the native one-second
 	// write coalescing window for inactivity, for either map.
-	result, err := backend.SweepAssignments(time.Nanosecond, 64)
+	result, err := backend.SweepFlows(time.Nanosecond, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,16 +298,43 @@ func TestSweepAssignmentsPreservesCoalescedActivity(t *testing.T) {
 	}
 }
 
-func TestSweepAssignmentsPreservesReturnFailureMap(t *testing.T) {
+func TestSweepFlowsPreservesPublishingClaim(t *testing.T) {
 	backend := newTestAssignmentBackend(t)
-	backend.assignmentCapacity = 64
+	backend.flowStore.assignment.capacity = 64
+	source := netip.MustParseAddrPort("192.0.2.10:53000")
+	destination := netip.MustParseAddrPort("1.1.1.1:53")
+	key, err := makeTCAssignKey(ProtocolUDP, source, destination, 17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := TCAssignment{SocketCookie: 0x5555, InterfaceIndex: 17, Path: TCPathShared, Generation: 9, LastSeenNS: 1}
+	if err = updateMap(backend.flowStore.assignment.mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+		t.Fatal(err)
+	}
+	claim := tcAssignmentClaim{SocketCookie: value.SocketCookie, Generation: value.Generation, State: tcAssignmentClaimPublish}
+	if err = backend.runtime.maps["tc_assignment_claim"].Put(key, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := backend.SweepFlows(time.Second, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 0 || result.InFlight != 1 {
+		t.Fatalf("publishing claim was reclaimed: %+v", result)
+	}
+}
+
+func TestSweepFlowsPreservesReturnFailureMap(t *testing.T) {
+	backend := newTestAssignmentBackend(t)
+	backend.flowStore.assignment.capacity = 64
 	delete(backend.runtime.maps, "tc_return")
 
-	result, err := backend.SweepAssignments(time.Second, 64)
+	result, err := backend.SweepFlows(time.Second, 64)
 	if err == nil {
 		t.Fatal("sweep without the return map succeeded")
 	}
-	if result.Failure != TCAssignmentSweepFailureClosed || result.FailureMap != "sb_tc_return" {
+	if result.Failure != TCFlowSweepFailureClosed || result.FailureMap != "sb_tc_return" {
 		t.Fatalf("sweep failure = %+v, want closed sb_tc_return", result)
 	}
 }

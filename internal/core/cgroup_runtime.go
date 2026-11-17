@@ -27,6 +27,7 @@ type UDPReleaseEvent struct {
 
 const (
 	cgroupUDPReleaseRingSize            = 64 * 1024
+	cgroupUDPReleaseStatsCount          = 8
 	cgroupUDPUserspaceCleanupDeadline   = "deadline"
 	cgroupUDPUserspaceCleanupRingBuffer = "ringbuf"
 	cgroupUDPStateFull                  = "full"
@@ -143,6 +144,21 @@ func (b *CgroupBackend) CgroupPath() string {
 	return b.cgroupPath
 }
 
+// PeerDestinationRestoreSupported reports whether the selected cgroup
+// getpeername hook is available for the address family.  The hook is an
+// optional compatibility enhancement: interception continues to work on
+// kernels that do not implement it, but redirected connected sockets then
+// expose the listener/token destination to userspace.
+func (b *CgroupBackend) PeerDestinationRestoreSupported(ipv6 bool) bool {
+	if b == nil || b.runtime == nil {
+		return false
+	}
+	if ipv6 {
+		return b.runtime.getpeername6_supported
+	}
+	return b.runtime.getpeername4_supported
+}
+
 // AttachModes returns the effective attach mechanism per loaded cgroup
 // program. It is a diagnostic snapshot only; it never probes or changes
 // attachments and therefore is safe to call from the request-driven API.
@@ -218,6 +234,9 @@ func (b *CgroupBackend) UDPStorageMode() string {
 	if b.runtime == nil || !b.runtime.enable_udp {
 		return "disabled"
 	}
+	if b.runtime.sk_storage {
+		return "socket_storage"
+	}
 	return "lru"
 }
 
@@ -235,6 +254,25 @@ func (b *CgroupBackend) UDPUserspaceCleanupMode() string {
 // It is read only when diagnostics are requested and does not add polling or
 // userspace work to the normal data path.
 func (b *CgroupBackend) UDPReleaseNotificationDrops() (uint64, error) {
+	return b.UDPReleaseStat(CgroupUDPStatReleaseNotificationDrops)
+}
+
+type CgroupUDPStat uint32
+
+const (
+	CgroupUDPStatReleaseNotificationDrops CgroupUDPStat = iota
+	CgroupUDPStatTCPRedirectFailure
+	CgroupUDPStatUDPRedirectFailure
+	CgroupUDPStatUDPTokenFailure
+	CgroupUDPStatUDPTokenReverseFailure
+	CgroupUDPStatUDPPeerFailure
+	CgroupUDPStatTCPPeerFailure
+	CgroupUDPStatUDPRecoveryFailure
+)
+
+// UDPReleaseStat reads one aggregated per-CPU cgroup admission counter. It is
+// diagnostic-only and never runs from a packet or maintenance path.
+func (b *CgroupBackend) UDPReleaseStat(stat CgroupUDPStat) (uint64, error) {
 	if b == nil {
 		return 0, unix.EOPNOTSUPP
 	}
@@ -247,7 +285,7 @@ func (b *CgroupBackend) UDPReleaseNotificationDrops() (uint64, error) {
 	if statsMap == nil {
 		return 0, unix.EOPNOTSUPP
 	}
-	index := uint32(0)
+	index := uint32(stat)
 	var perCPU []uint64
 	if err := statsMap.Lookup(&index, &perCPU); err != nil {
 		return 0, err
@@ -277,15 +315,22 @@ func (b *CgroupBackend) ReadUDPRelease() (UDPReleaseEvent, error) {
 	b.access.RUnlock()
 
 	b.udpReleaseReadAccess.Lock()
-	defer b.udpReleaseReadAccess.Unlock()
-	if err := reader.ReadInto(&runtimeState.udp_release_record); err != nil {
+	err := reader.ReadInto(&runtimeState.udp_release_record)
+	if err != nil {
+		b.udpReleaseReadAccess.Unlock()
 		if errors.Is(err, ringbuf.ErrClosed) {
 			return UDPReleaseEvent{}, os.ErrClosed
 		}
+		// A reader error is terminal for this ring-buffer instance. Do not
+		// leave diagnostics claiming that release notifications are active:
+		// userspace must fall back to deadline/watchdog cleanup instead.
+		b.markUDPReleaseReaderFailed(reader)
 		return UDPReleaseEvent{}, err
 	}
 	sample := runtimeState.udp_release_record.RawSample
 	if len(sample) != 40 {
+		b.udpReleaseReadAccess.Unlock()
+		b.markUDPReleaseReaderFailed(reader)
 		return UDPReleaseEvent{}, unix.EPROTO
 	}
 	var key listenerLookupKey
@@ -294,18 +339,50 @@ func (b *CgroupBackend) ReadUDPRelease() (UDPReleaseEvent, error) {
 	key.ListenerPort = binary.NativeEndian.Uint16(sample[10:12])
 	copy(key.TokenAddr[:], sample[12:28])
 	if key.Protocol != ProtocolUDP {
+		b.udpReleaseReadAccess.Unlock()
+		b.markUDPReleaseReaderFailed(reader)
 		return UDPReleaseEvent{}, unix.EPROTO
 	}
 	listener, err := listenerDestinationFromKey(key)
 	if err != nil {
+		b.udpReleaseReadAccess.Unlock()
+		b.markUDPReleaseReaderFailed(reader)
 		return UDPReleaseEvent{}, E.Cause(err, "decode UDP release listener")
 	}
+	b.udpReleaseReadAccess.Unlock()
 	return UDPReleaseEvent{
 		SocketCookie:      binary.NativeEndian.Uint64(sample[0:8]),
 		Listener:          listener,
 		NetworkGeneration: binary.NativeEndian.Uint32(sample[28:32]),
 		ReleasedAtNS:      binary.NativeEndian.Uint64(sample[32:40]),
 	}, nil
+}
+
+// markUDPReleaseReaderFailed disables only the userspace notification path.
+// The kernel socket-release hook and its recovery map remain usable; callers
+// continue through the deadline/watchdog cleanup path. The read lock is
+// released by ReadUDPRelease before this method closes the failed reader.
+func (b *CgroupBackend) markUDPReleaseReaderFailed(reader *ringbuf.Reader) {
+	if b == nil || reader == nil {
+		return
+	}
+	b.access.Lock()
+	if b.runtime == nil || b.runtime.udp_release_reader != reader {
+		b.access.Unlock()
+		return
+	}
+	b.runtime.udp_release_reader = nil
+	b.runtime.udp_release_observer = false
+	b.runtime.udp_release_fallback_reason = "release_notification_reader_failed"
+	// Keep the already attached release hook on its cookie-only path. The
+	// object does not need to be reloaded: clearing the control bit prevents
+	// further ring-buffer submissions and avoids turning a reader failure into
+	// a permanent kernel-side drop stream.
+	if err := b.updateCgroupControl(b.listenerPort); err != nil {
+		b.runtime.udp_release_fallback_reason = "release_notification_reader_failed_control_update"
+	}
+	b.access.Unlock()
+	_ = reader.Close()
 }
 
 func cgroupUDPCleanupModeLocked(runtimeState *cgroupRuntime) string {

@@ -317,6 +317,62 @@ func TestCgroupReleaseNotificationUsesRingBufferHelper(t *testing.T) {
 	}
 }
 
+func TestEmbeddedCgroupStorageObjectLayout(t *testing.T) {
+	spec, err := loadCgroupStorage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := spec.Maps["cgroup_socket_peer_storage"]
+	if storage == nil || storage.Type != CiliumEBPF.SkStorage || storage.ValueSize == 0 {
+		t.Fatalf("invalid cgroup socket storage map: %+v", storage)
+	}
+	if spec.Maps["cgroup_udp_peer"] != nil || spec.Maps["cgroup_tcp_peer"] != nil {
+		t.Fatal("socket-storage object still contains cookie-keyed peer maps")
+	}
+	foundHelper := false
+	for _, program := range spec.Programs {
+		for _, instruction := range program.Instructions {
+			if instruction.IsBuiltinCall() && asm.BuiltinFunc(instruction.Constant) == asm.FnSkStorageGet {
+				foundHelper = true
+				break
+			}
+		}
+		if foundHelper {
+			break
+		}
+	}
+	if !foundHelper {
+		t.Fatal("socket-storage object does not use bpf_sk_storage_get")
+	}
+}
+
+func TestEmbeddedCgroupDirectTGIDObjectLayout(t *testing.T) {
+	legacy, err := loadCgroup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := loadCgroupTGID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasHelper := func(spec *CiliumEBPF.CollectionSpec) bool {
+		for _, program := range spec.Programs {
+			for _, instruction := range program.Instructions {
+				if instruction.IsBuiltinCall() && asm.BuiltinFunc(instruction.Constant) == asm.FnGetCurrentPidTgid {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if hasHelper(legacy) {
+		t.Fatal("legacy cgroup object unexpectedly requires current TGID")
+	}
+	if !hasHelper(direct) {
+		t.Fatal("direct-TGID cgroup object does not read the current TGID")
+	}
+}
+
 func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
 		"tc_control":             {4, 32},
@@ -325,7 +381,8 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 		"tc_shared_force4":       {8, 1},
 		"tc_shared_force6":       {20, 1},
 		"tc_listener_sockets":    {4, 4},
-		"tc_assignment":          {44, 32},
+		"tc_assignment":          {44, 40},
+		"tc_assignment_claim":    {44, 16},
 		"tc_return":              {44, 40},
 		"tc_return_frag":         {44, 40},
 		"tc_stats":               {4, 8},
@@ -357,6 +414,57 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 		"classifier/isolated_delivery_udp",
 		"classifier/isolated_return",
 	})
+}
+
+func TestEmbeddedTCStorageObjectLayout(t *testing.T) {
+	spec, err := loadTCStorage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := spec.Maps["tc_self_storage"]
+	if storage == nil || storage.Type != CiliumEBPF.SkStorage || storage.KeySize != 4 || storage.ValueSize != 4 {
+		t.Fatalf("invalid TC self-bypass storage map: %+v", storage)
+	}
+	var storageGet, fullsock bool
+	for _, program := range spec.Programs {
+		if !strings.HasPrefix(program.SectionName, "classifier/local_egress_") {
+			continue
+		}
+		for _, instruction := range program.Instructions {
+			if !instruction.IsBuiltinCall() {
+				continue
+			}
+			switch asm.BuiltinFunc(instruction.Constant) {
+			case asm.FnSkStorageGet:
+				storageGet = true
+			case asm.FnSkFullsock:
+				fullsock = true
+			}
+		}
+	}
+	if !storageGet || !fullsock {
+		t.Fatalf("TC storage reader helpers: sk_storage_get=%v sk_fullsock=%v", storageGet, fullsock)
+	}
+}
+
+func TestEmbeddedTCAssignmentIsExplicitlyOwned(t *testing.T) {
+	spec, err := loadTC()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := spec.Maps["tc_assignment"]
+	if assignment == nil {
+		t.Fatal("missing tc_assignment map")
+	}
+	if assignment.Type != CiliumEBPF.Hash {
+		t.Fatalf("tc_assignment type = %s, want hash", assignment.Type)
+	}
+	if assignment.MaxEntries != tcAssignmentCapacity {
+		t.Fatalf("tc_assignment max entries = %d, want %d", assignment.MaxEntries, tcAssignmentCapacity)
+	}
+	if assignment.Flags&bpfFlagNoPrealloc == 0 {
+		t.Fatalf("tc_assignment flags = %#x, want BPF_F_NO_PREALLOC", assignment.Flags)
+	}
 }
 
 func testEmbeddedObjectLayout(
@@ -410,6 +518,8 @@ func TestKernelProgramNames(t *testing.T) {
 		kernelProgramNameCgroupSendmsg6,
 		kernelProgramNameCgroupRecvmsg6,
 		kernelProgramNameCgroupRelease,
+		kernelProgramNameCgroupGetpeername4,
+		kernelProgramNameCgroupGetpeername6,
 		kernelProgramNameTCLocalEthernet,
 		kernelProgramNameTCLocalRawIP,
 		kernelProgramNameTCSharedEthernet,
@@ -441,6 +551,38 @@ func TestKernelProgramNames(t *testing.T) {
 		}
 		if _, exists := seen[name]; exists {
 			t.Fatalf("duplicate kernel program name: %s", name)
+		}
+		seen[name] = struct{}{}
+	}
+}
+
+func TestKernelMapNames(t *testing.T) {
+	// These are the names assigned to maps that are visible in the kernel.
+	// Object symbols may be longer, but every selected override and every
+	// directly-created map must fit BPF_OBJ_NAME_LEN including its NUL byte.
+	names := []string{
+		"sb_cg_control", "sb_cg_tcp", "sb_cg_tcp_peer", "sb_cg_udp", "sb_cg_recover",
+		"sb_cg_token", "sb_cg_token_rev", "sb_cg_peer", "sb_cg_flow", "sb_cg_sock_byp",
+		"sb_cg_byp_port", "sb_cg_uid", "sb_cg_bypass4", "sb_cg_bypass6", "sb_cg_host4", "sb_cg_host6",
+		"sb_cg_rel_watch", "sb_cg_rel_evt", "sb_cg_rel_stat", "sb_cg_force4", "sb_cg_force6",
+		"sb_tc_ctl", "sb_tc_listen", "sb_tc_assign", "sb_tc_claim", "sb_tc_stats", "sb_tc_uid", "sb_tc_lbypass4",
+		"sb_tc_lbypass6", "sb_tc_sbypass4", "sb_tc_sbypass6", "sb_tc_insrc4", "sb_tc_insrc6",
+		"sb_tc_exsrc4", "sb_tc_exsrc6", "sb_tc_insmac", "sb_tc_exsmac", "sb_tc_host4", "sb_tc_host6",
+		"sb_tc_lport", "sb_tc_sport", "sb_self_sockets", "sb_self_store", "sb_tc_return", "sb_tc_rfrag",
+		"sb_tc_lforce4", "sb_tc_lforce6", "sb_tc_sforce4", "sb_tc_sforce6",
+		"sb_sh_control", "sb_sh_stats", "sb_sh_orig", "sb_sh_bypass", "sb_sh_token", "sb_sh_host4", "sb_sh_host6",
+		"sb_sh_inc4", "sb_sh_inc6", "sb_sh_exc4", "sb_sh_exc6", "sb_sh_inmac", "sb_sh_exmac", "sb_sh_port", "sb_sh_scratch",
+		"sb_sh_bypass4", "sb_sh_bypass6", "sb_sh_force4", "sb_sh_force6",
+		"sb_icmp_ctl", "sb_icmp_stat", "sb_icmp_lforce4", "sb_icmp_lforce6", "sb_icmp_sforce4", "sb_icmp_sforce6",
+		"sb_proc_owner", "sb_proc_uid", "sb_proc_probe", "sb_lpm_probe", "sb_tcx_prio",
+	}
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if err := validateKernelObjectName(name); err != nil {
+			t.Errorf("map name %q: %v", name, err)
+		}
+		if _, ok := seen[name]; ok {
+			t.Errorf("duplicate kernel map name: %s", name)
 		}
 		seen[name] = struct{}{}
 	}

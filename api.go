@@ -28,12 +28,13 @@ type (
 	SharedPacketRewriteMapCapacity = core.SharedPacketRewriteMapCapacity
 	OriginalDestination            = core.OriginalDestination
 	CgroupBackend                  = core.CgroupBackend
+	CgroupUDPStat                  = core.CgroupUDPStat
 	SharedPacketRewriteConfig      = core.SharedPacketRewriteConfig
 	SharedPacketRewriteFlowHandle  = core.SharedPacketRewriteFlowHandle
 	SharedPacketRewriteSweepResult = core.SharedPacketRewriteSweepResult
 	TCAssignment                   = core.TCAssignment
 	TCReturnHandle                 = core.TCReturnHandle
-	TCAssignmentSweepResult        = core.TCAssignmentSweepResult
+	TCFlowSweepResult              = core.TCFlowSweepResult
 	TCStats                        = core.TCStats
 	TCLinkFraming                  = core.TCLinkFraming
 	AttachmentInfo                 = core.AttachmentInfo
@@ -41,6 +42,8 @@ type (
 	TCDiagnostics                  = core.TCDiagnostics
 	SelfBypassCgroupConfig         = core.SelfBypassCgroupConfig
 	SelfBypassMode                 = core.SelfBypassMode
+	SelfBypassDiagnostics          = core.SelfBypassDiagnostics
+	SocketRegistration             = core.SocketRegistration
 	ProcessSocketOwner             = core.ProcessSocketOwner
 	ProcessTracker                 = core.ProcessTracker
 	LocalRouteSet                  = core.LocalRouteSet
@@ -60,6 +63,17 @@ type (
 	UDPStateDiagnostics            = core.UDPStateDiagnostics
 	UDPReleaseEvent                = core.UDPReleaseEvent
 	UDPRecoverySweepResult         = core.UDPRecoverySweepResult
+)
+
+const (
+	CgroupUDPStatReleaseNotificationDrops = core.CgroupUDPStatReleaseNotificationDrops
+	CgroupUDPStatTCPRedirectFailure       = core.CgroupUDPStatTCPRedirectFailure
+	CgroupUDPStatUDPRedirectFailure       = core.CgroupUDPStatUDPRedirectFailure
+	CgroupUDPStatUDPTokenFailure          = core.CgroupUDPStatUDPTokenFailure
+	CgroupUDPStatUDPTokenReverseFailure   = core.CgroupUDPStatUDPTokenReverseFailure
+	CgroupUDPStatUDPPeerFailure           = core.CgroupUDPStatUDPPeerFailure
+	CgroupUDPStatTCPPeerFailure           = core.CgroupUDPStatTCPPeerFailure
+	CgroupUDPStatUDPRecoveryFailure       = core.CgroupUDPStatUDPRecoveryFailure
 )
 
 const (
@@ -84,6 +98,7 @@ const (
 	UDPRecoveryMapCapacity                   = core.UDPRecoveryMapCapacity
 	CompactSelfBypassSocketCapacity          = core.CompactSelfBypassSocketCapacity
 	CompactTCAssignmentCapacity              = core.CompactTCAssignmentCapacity
+	TCPolicyPortCapacity                     = core.TCPolicyPortCapacity
 	MaxConfigurableMapCapacity               = core.MaxConfigurableMapCapacity
 	MapCategoryRuntime                       = core.MapCategoryRuntime
 	MapCategoryConfiguredPolicy              = core.MapCategoryConfiguredPolicy
@@ -96,10 +111,12 @@ const (
 	TCLinkFramingEthernet    = core.TCLinkFramingEthernet
 	TCLinkFramingRawIP       = core.TCLinkFramingRawIP
 
-	SelfBypassUserspace        = core.SelfBypassUserspace
-	SelfBypassCgroupSocket     = core.SelfBypassCgroupSocket
-	SelfBypassCgroupSocketAddr = core.SelfBypassCgroupSocketAddr
-	SelfBypassUserspaceRelease = core.SelfBypassUserspaceRelease
+	SelfBypassUserspace               = core.SelfBypassUserspace
+	SelfBypassCgroupSocket            = core.SelfBypassCgroupSocket
+	SelfBypassCgroupSocketAddrRelease = core.SelfBypassCgroupSocketAddrRelease
+	SelfBypassCgroupSocketAddr        = core.SelfBypassCgroupSocketAddr
+	SelfBypassUserspaceRelease        = core.SelfBypassUserspaceRelease
+	SelfBypassDirectTGID              = core.SelfBypassDirectTGID
 
 	KernelProbeModeAll    = core.KernelProbeModeAll
 	KernelProbeModeLocal  = core.KernelProbeModeLocal
@@ -168,18 +185,56 @@ func (b *SelfBypass) CleanupMode() string {
 	return core.UnwrapSelfBypass(b).Mode().CleanupMode()
 }
 
-func (b *SelfBypass) RegisterSocket(rawConn syscall.RawConn) error {
+func (b *SelfBypass) NeedsUserspaceRegistration() bool {
+	return b != nil && core.UnwrapSelfBypass(b).NeedsUserspaceRegistration()
+}
+
+func (b *SelfBypass) NeedsUserspaceUnregister() bool {
+	return b != nil && core.UnwrapSelfBypass(b).NeedsUserspaceUnregister()
+}
+
+// Diagnostics reports the actual ownership, metadata, cleanup and attachment
+// backends selected after capability probing and verifier fallback.
+func (b *SelfBypass) Diagnostics() SelfBypassDiagnostics {
+	if b == nil {
+		return core.SelfBypassDiagnostics{}
+	}
+	return core.UnwrapSelfBypass(b).Diagnostics()
+}
+
+func (b *SelfBypass) CleanupBackend() string {
+	if b == nil {
+		return "userspace_unregister"
+	}
+	return core.UnwrapSelfBypass(b).CleanupBackend()
+}
+
+func (b *SelfBypass) FallbackReason() string {
+	if b == nil {
+		return ""
+	}
+	return core.UnwrapSelfBypass(b).FallbackReason()
+}
+
+func (b *SelfBypass) RegisterSocket(rawConn syscall.RawConn) (SocketRegistration, error) {
 	if b == nil {
 		return core.UnwrapSelfBypass(nil).RegisterSocket(rawConn)
 	}
 	return core.UnwrapSelfBypass(b).RegisterSocket(rawConn)
 }
 
-func (b *SelfBypass) UnregisterSocket(rawConn syscall.RawConn) error {
+func (b *SelfBypass) SocketCookie(rawConn syscall.RawConn) (uint64, error) {
+	if b == nil {
+		return 0, errors.New("eBPF self-bypass map is unavailable")
+	}
+	return core.UnwrapSelfBypass(b).SocketCookie(rawConn)
+}
+
+func (b *SelfBypass) UnregisterSocket(registration SocketRegistration) error {
 	if b == nil {
 		return nil
 	}
-	return core.UnwrapSelfBypass(b).UnregisterSocket(rawConn)
+	return core.UnwrapSelfBypass(b).UnregisterSocket(registration)
 }
 
 func (b *SelfBypass) IsClosed() bool {
@@ -256,6 +311,7 @@ type TCConfig struct {
 	TrackProcess       bool
 	ICMPEchoReply      bool
 	AssignmentCapacity uint32
+	NetworkGeneration  uint32
 }
 
 type TCBackend struct {
@@ -278,6 +334,7 @@ func PrepareTC(config TCConfig) (*TCBackend, error) {
 		TrackProcess:       config.TrackProcess,
 		ICMPEchoReply:      config.ICMPEchoReply,
 		AssignmentCapacity: config.AssignmentCapacity,
+		NetworkGeneration:  config.NetworkGeneration,
 	}, config.SelfBypass)
 	if err != nil {
 		return nil, err
@@ -316,8 +373,8 @@ func (b *TCBackend) RemoveAssignmentIfMatch(protocol uint8, source, destination 
 	return core.UnwrapTCBackend(b).RemoveAssignmentIfMatch(protocol, source, destination, interfaceIndex, expected)
 }
 
-func (b *TCBackend) SweepAssignments(maxIdle time.Duration, fallbackBudget uint32) (TCAssignmentSweepResult, error) {
-	return core.UnwrapTCBackend(b).SweepAssignments(maxIdle, fallbackBudget)
+func (b *TCBackend) SweepFlows(maxIdle time.Duration, fallbackBudget uint32) (TCFlowSweepResult, error) {
+	return core.UnwrapTCBackend(b).SweepFlows(maxIdle, fallbackBudget)
 }
 
 func (b *TCBackend) Stats() (TCStats, error) {
@@ -326,6 +383,10 @@ func (b *TCBackend) Stats() (TCStats, error) {
 
 func (b *TCBackend) SetDeliveryInterface(interfaceIndex uint32, hardwareAddress MACAddress) error {
 	return core.UnwrapTCBackend(b).SetDeliveryInterface(interfaceIndex, hardwareAddress)
+}
+
+func (b *TCBackend) SetNetworkGeneration(generation uint32) error {
+	return core.UnwrapTCBackend(b).SetNetworkGeneration(generation)
 }
 
 func (b *TCBackend) SetRoutingMark(mark uint32) error {

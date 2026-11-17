@@ -87,17 +87,20 @@ func loadCgroupProbeObject(plan kernelProbePlan) (string, error) {
 		return "Loads the generated cgroup programs without attaching cgroup hooks.", err
 	}
 	runtimeState := &cgroupRuntime{
-		maps:                  make(map[string]*CiliumEBPF.Map),
-		programs:              make([]*CiliumEBPF.Program, cgroupProgramCount),
-		enable_tcp:            plan.enableTCP,
-		enable_udp:            plan.enableUDP,
-		coarse_time_supported: plan.enableUDP && features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnKtimeGetCoarseNs) == nil,
-		getpeername_supported: probeGetpeernameSupport(),
+		maps:                   make(map[string]*CiliumEBPF.Map),
+		programs:               make([]*CiliumEBPF.Program, cgroupProgramCount),
+		enable_tcp:             plan.enableTCP,
+		enable_udp:             plan.enableUDP,
+		coarse_time_supported:  plan.enableUDP && features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnKtimeGetCoarseNs) == nil,
+		getpeername4_supported: probeGetpeernameSupport(CiliumEBPF.AttachCgroupInet4GetPeername),
+		getpeername6_supported: probeGetpeernameSupport(CiliumEBPF.AttachCgroupInet6GetPeername),
+		direct_tgid:            features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnGetCurrentPidTgid) == nil,
 	}
 	backend := &CgroupBackend{
-		runtime:      runtimeState,
-		redirectIPv4: netip.MustParsePrefix("127.0.0.0/8"),
-		enableIPv6:   plan.enableIPv6,
+		runtime:        runtimeState,
+		redirectIPv4:   netip.MustParsePrefix("127.0.0.0/8"),
+		enableIPv6:     plan.enableIPv6,
+		selfBypassTGID: 1,
 	}
 	if plan.enableIPv6 {
 		backend.redirectIPv6 = netip.MustParsePrefix("fd00::/64")
@@ -118,13 +121,18 @@ func loadCgroupProbeObject(plan kernelProbePlan) (string, error) {
 		if runtimeState.coarse_time_supported {
 			detail += " The coarse-time UDP variant loaded."
 		}
+		if runtimeState.direct_tgid {
+			detail += " The direct-TGID self-bypass variant loaded."
+		} else {
+			detail += " The cookie-based self-bypass variant loaded."
+		}
 	}
 	return detail, errors.Join(err, backend.Close(), selfBypass.Close())
 }
 
 func loadProcessTrackerProbeObject(plan kernelProbePlan) (string, error) {
 	owners, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
-		Name:       "sb_proc_owner_probe",
+		Name:       "sb_proc_probe",
 		Type:       CiliumEBPF.LRUHash,
 		KeySize:    8,
 		ValueSize:  8,

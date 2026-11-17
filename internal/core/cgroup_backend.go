@@ -87,55 +87,60 @@ type cgroupRuntime struct {
 	udp_release_observer        bool
 	udp_release_fallback_reason string
 	socket_release_supported    bool
+	// sk_storage binds peer restoration to the kernel socket lifetime. It is
+	// selected only when the optional map type and socket-release hook both
+	// exist; older Android/vendor kernels retain the cookie-map fallback.
+	sk_storage bool
 	// getpeername_supported reports Linux 5.8+ getpeername hooks. They are
 	// optional: without them a redirected socket reports its listener token
 	// as the peer, as before.
-	getpeername_supported bool
-	coarse_time_supported bool
-	enable_tcp            bool
-	enable_udp            bool
-	uid_policy            bool
-	uid_default_bypass    bool
-	bypass_ipv4_policy    bool
-	bypass_ipv6_policy    bool
-	bypass_port_policy    bool
+	getpeername4_supported bool
+	getpeername6_supported bool
+	coarse_time_supported  bool
+	direct_tgid            bool
+	enable_tcp             bool
+	enable_udp             bool
+	uid_policy             bool
+	uid_default_bypass     bool
+	bypass_ipv4_policy     bool
+	bypass_ipv6_policy     bool
+	bypass_port_policy     bool
 }
 
 type CgroupBackend struct {
-	access                  sync.RWMutex
-	health                  backendHealth
-	udpRecoveryAccess       sync.Mutex
-	recoverySweepScratch    mapScanScratch[listenerLookupKey, originalDestinationValue]
-	recoverySweepCandidates []udpRecoveryEntry
-	recoverySweepRemoved    uint32
-	udpReleaseReadAccess    sync.Mutex
-	udpReplyTokenSequence   atomic.Uint64
-	lookupAndDeleteMode     atomic.Int32
-	udpRecoveryConsumeMode  atomic.Int32
-	runtime                 *cgroupRuntime
-	mapCapacity             CgroupMapCapacity
-	tcpRedirectMapFD        int
-	udpRedirectMapFD        int
-	udpRecoveryMapFD        int
-	udpFlowMapFD            int
-	socketBypassMapFD       int
-	bypassIPv4CIDRMapFD     int
-	bypassIPv6CIDRMapFD     int
-	hostIPv4MapFD           int
-	hostIPv6MapFD           int
-	bypassIPv4CIDR          []netip.Prefix
-	bypassIPv6CIDR          []netip.Prefix
-	hostIPv4                []netip.Prefix
-	hostIPv6                []netip.Prefix
-	cgroupPath              string
-	redirectIPv4            netip.Prefix
-	redirectIPv6            netip.Prefix
-	enableIPv6              bool
-	enableUDP               bool
-	forceIPv4, forceIPv6    bool
-	udpTimeoutSeconds       uint32
-	networkGeneration       uint32
-	listenerPort            uint16
+	access                 sync.RWMutex
+	health                 backendHealth
+	recovery               cgroupRecoveryStore
+	udpReleaseReadAccess   sync.Mutex
+	udpReplyTokenSequence  atomic.Uint64
+	lookupAndDeleteMode    atomic.Int32
+	udpRecoveryConsumeMode atomic.Int32
+	runtime                *cgroupRuntime
+	mapCapacity            CgroupMapCapacity
+	tcpRedirectMapFD       int
+	udpRedirectMapFD       int
+	udpRecoveryMapFD       int
+	udpFlowMapFD           int
+	socketBypassMapFD      int
+	bypassIPv4CIDRMapFD    int
+	bypassIPv6CIDRMapFD    int
+	hostIPv4MapFD          int
+	hostIPv6MapFD          int
+	bypassIPv4CIDR         []netip.Prefix
+	bypassIPv6CIDR         []netip.Prefix
+	hostIPv4               []netip.Prefix
+	hostIPv6               []netip.Prefix
+	cgroupPath             string
+	redirectIPv4           netip.Prefix
+	redirectIPv6           netip.Prefix
+	enableIPv6             bool
+	enableUDP              bool
+	forceIPv4, forceIPv6   bool
+	udpTimeoutSeconds      uint32
+	networkGeneration      uint32
+	listenerPort           uint16
+	selfBypass             *SelfBypass
+	selfBypassTGID         uint32
 }
 
 func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
@@ -234,6 +239,7 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		}
 	}
 	socketReleaseSupported := false
+	skStorage := false
 	coarseTimeSupported := false
 	if config.EnableUDP {
 		coarseTimeSupported = features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnKtimeGetCoarseNs) == nil
@@ -242,6 +248,11 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 			closeCgroup()
 			return nil, eBPFOperationError("probe socket release attachment", err)
 		}
+	}
+	if socketReleaseSupported &&
+		features.HaveMapType(CiliumEBPF.SkStorage) == nil &&
+		features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnSkStorageGet) == nil {
+		skStorage = true
 	}
 	runtimeState := &cgroupRuntime{
 		cgroupFile:               cgroupFile,
@@ -256,10 +267,23 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		bypass_ipv6_policy:       len(policy.localInitialBypass.ipv6) > 0,
 		bypass_port_policy:       len(policy.localBypassPortEntries) > 0,
 		socket_release_supported: socketReleaseSupported,
+		sk_storage:               skStorage,
 		coarse_time_supported:    coarseTimeSupported,
-		getpeername_supported:    probeGetpeernameSupport(),
+		getpeername4_supported:   probeGetpeernameSupport(CiliumEBPF.AttachCgroupInet4GetPeername),
+		getpeername6_supported:   probeGetpeernameSupport(CiliumEBPF.AttachCgroupInet6GetPeername),
 	}
 	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries), len(policy.localBypassPortEntries), config.SelfBypassMap, policy.localForce); err != nil {
+		if runtimeState.sk_storage {
+			// Map-type probes are advisory on vendor kernels. Retry with the
+			// cookie-map object if SK_STORAGE creation or verifier support is
+			// incomplete despite the positive feature probe.
+			_ = closeMaps(runtimeState.maps)
+			runtimeState.maps = make(map[string]*CiliumEBPF.Map)
+			runtimeState.sk_storage = false
+			err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries), len(policy.localBypassPortEntries), config.SelfBypassMap, policy.localForce)
+		}
+	}
+	if err != nil {
 		_ = closeMaps(runtimeState.maps)
 		closeCgroup()
 		if errors.Is(err, unix.EPERM) {
@@ -289,9 +313,12 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		enableIPv6:          config.EnableIPv6,
 		enableUDP:           config.EnableUDP,
 		udpTimeoutSeconds:   udpTimeoutSeconds,
+		selfBypass:          config.selfBypass,
+		selfBypassTGID:      config.selfBypassTGID,
 		bypassIPv4CIDR:      slices.Clone(policy.localInitialBypass.ipv4),
 		bypassIPv6CIDR:      slices.Clone(policy.localInitialBypass.ipv6),
 	}
+	runtimeState.direct_tgid = config.selfBypassTGID != 0
 	if err = populateCompiledPolicyMaps(policyMapTargets{
 		LocalForceIPv4:  runtimeState.maps["cgroup_force4"],
 		LocalForceIPv6:  runtimeState.maps["cgroup_force6"],

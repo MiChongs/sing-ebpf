@@ -14,18 +14,21 @@ import (
 // MapOccupancy describes one sing-ebpf map observed by an explicit diagnostic
 // request. It is intentionally not collected by any runtime worker.
 type MapOccupancy struct {
-	ID         CiliumEBPF.MapID `json:"id"`
-	Name       string           `json:"name"`
-	Category   MapCategory      `json:"category"`
-	Type       string           `json:"type"`
-	MaxEntries uint32           `json:"max_entries"`
-	KeySize    uint32           `json:"key_size"`
-	ValueSize  uint32           `json:"value_size"`
-	Flags      uint32           `json:"flags"`
-	Entries    uint32           `json:"entries,omitempty"`
-	Pressure   string           `json:"pressure"`
-	Supported  bool             `json:"supported"`
-	Error      string           `json:"error,omitempty"`
+	ID                CiliumEBPF.MapID `json:"id"`
+	Name              string           `json:"name"`
+	Category          MapCategory      `json:"category"`
+	Type              string           `json:"type"`
+	MaxEntries        uint32           `json:"max_entries"`
+	KeySize           uint32           `json:"key_size"`
+	ValueSize         uint32           `json:"value_size"`
+	Flags             uint32           `json:"flags"`
+	Entries           uint32           `json:"entries,omitempty"`
+	Pressure          string           `json:"pressure"`
+	OccupancyMode     string           `json:"occupancy_mode"`
+	EvictionMode      string           `json:"eviction_mode"`
+	AdmissionCritical bool             `json:"admission_critical"`
+	Supported         bool             `json:"supported"`
+	Error             string           `json:"error,omitempty"`
 }
 
 // MapCategory identifies the semantic role used when interpreting map
@@ -45,44 +48,85 @@ const (
 // classification here prevents consumers from duplicating sing-ebpf's map
 // naming scheme.
 type mapMetadata struct {
-	category MapCategory
+	category          MapCategory
+	evictionMode      string
+	admissionCritical bool
 }
 
-var configuredPolicyMapMetadata = map[string]mapMetadata{
-	"sb_cg_force4":                {category: MapCategoryConfiguredPolicy},
-	"sb_cg_force6":                {category: MapCategoryConfiguredPolicy},
-	"sb_tc_lforce4":               {category: MapCategoryConfiguredPolicy},
-	"sb_tc_lforce6":               {category: MapCategoryConfiguredPolicy},
-	"sb_tc_sforce4":               {category: MapCategoryConfiguredPolicy},
-	"sb_tc_sforce6":               {category: MapCategoryConfiguredPolicy},
-	"sb_sh_force4":                {category: MapCategoryConfiguredPolicy},
-	"sb_sh_force6":                {category: MapCategoryConfiguredPolicy},
-	"sb_icmp_lforce4":             {category: MapCategoryConfiguredPolicy},
-	"sb_icmp_lforce6":             {category: MapCategoryConfiguredPolicy},
-	"sb_icmp_sforce4":             {category: MapCategoryConfiguredPolicy},
-	"sb_icmp_sforce6":             {category: MapCategoryConfiguredPolicy},
-	cgroupBypassPortKernelMapName: {category: MapCategoryConfiguredPolicy},
-	"sb_cg_uid":                   {category: MapCategoryConfiguredPolicy},
-	"sb_proc_uid":                 {category: MapCategoryConfiguredPolicy},
-	"sb_tc_uid":                   {category: MapCategoryConfiguredPolicy},
-	"sb_tc_insrc4":                {category: MapCategoryConfiguredPolicy},
-	"sb_tc_insrc6":                {category: MapCategoryConfiguredPolicy},
-	"sb_tc_exsrc4":                {category: MapCategoryConfiguredPolicy},
-	"sb_tc_exsrc6":                {category: MapCategoryConfiguredPolicy},
-	"sb_tc_insmac":                {category: MapCategoryConfiguredPolicy},
-	"sb_tc_exsmac":                {category: MapCategoryConfiguredPolicy},
-	"sb_tc_lport":                 {category: MapCategoryConfiguredPolicy},
-	"sb_tc_sport":                 {category: MapCategoryConfiguredPolicy},
-	"sb_sh_inmac":                 {category: MapCategoryConfiguredPolicy},
-	"sb_sh_exmac":                 {category: MapCategoryConfiguredPolicy},
-	"sb_sh_port":                  {category: MapCategoryConfiguredPolicy},
+const (
+	mapEvictionNone         = "none"
+	mapEvictionLRUSafeCache = "lru_safe_cache"
+)
+
+// mapMetadataRegistry is the single semantic source for maps owned by
+// sing-ebpf. Native objects and loader overrides still own their ABI and
+// capacities; this registry only describes how a map is interpreted by
+// diagnostics and maintenance. Keeping policy, core state and disposable
+// caches together prevents each backend from growing another name switch.
+var mapMetadataRegistry = map[string]mapMetadata{
+	// Compiled policy maps are sized from the active policy and are not runtime
+	// pressure evidence.
+	"sb_cg_force4":    {category: MapCategoryConfiguredPolicy},
+	"sb_cg_force6":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_lforce4":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_lforce6":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_sforce4":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_sforce6":   {category: MapCategoryConfiguredPolicy},
+	"sb_sh_force4":    {category: MapCategoryConfiguredPolicy},
+	"sb_sh_force6":    {category: MapCategoryConfiguredPolicy},
+	"sb_icmp_lforce4": {category: MapCategoryConfiguredPolicy},
+	"sb_icmp_lforce6": {category: MapCategoryConfiguredPolicy},
+	"sb_icmp_sforce4": {category: MapCategoryConfiguredPolicy},
+	"sb_icmp_sforce6": {category: MapCategoryConfiguredPolicy},
+	"sb_cg_byp_port":  {category: MapCategoryConfiguredPolicy},
+	"sb_cg_uid":       {category: MapCategoryConfiguredPolicy},
+	"sb_proc_uid":     {category: MapCategoryConfiguredPolicy},
+	"sb_tc_uid":       {category: MapCategoryConfiguredPolicy},
+	"sb_tc_insrc4":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_insrc6":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_exsrc4":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_exsrc6":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_insmac":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_exsmac":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_lport":     {category: MapCategoryConfiguredPolicy},
+	"sb_tc_sport":     {category: MapCategoryConfiguredPolicy},
+	"sb_sh_inmac":     {category: MapCategoryConfiguredPolicy},
+	"sb_sh_exmac":     {category: MapCategoryConfiguredPolicy},
+	"sb_sh_port":      {category: MapCategoryConfiguredPolicy},
+
+	// Disposable LRU state may be reclaimed without invalidating an established
+	// flow. Core runtime state is non-evicting and admission-critical.
+	"sb_tc_rfrag":     {category: MapCategoryRuntime, evictionMode: mapEvictionLRUSafeCache},
+	"sb_cg_recover":   {category: MapCategoryRuntime, evictionMode: mapEvictionLRUSafeCache},
+	"sb_cg_tcp":       {category: MapCategoryRuntime, evictionMode: mapEvictionLRUSafeCache, admissionCritical: true},
+	"sb_cg_tcp_peer":  {category: MapCategoryRuntime, evictionMode: mapEvictionLRUSafeCache, admissionCritical: true},
+	"sb_cg_flow":      {category: MapCategoryRuntime, evictionMode: mapEvictionLRUSafeCache},
+	"sb_sh_bypass":    {category: MapCategoryRuntime, evictionMode: mapEvictionLRUSafeCache},
+	"sb_self_sockets": {category: MapCategoryRuntime, admissionCritical: true},
+	// Socket-local storage is kernel-owned lifetime state. It has no global
+	// max_entries occupancy and must not make diagnostics report degraded.
+	"sb_self_store":   {category: MapCategoryRuntime},
+	"sb_cg_sock_byp":  {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_cg_sk_peer":   {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_cg_udp":       {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_cg_token":     {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_cg_token_rev": {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_cg_peer":      {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_tc_assign":    {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_tc_return":    {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_sh_orig":      {category: MapCategoryRuntime, admissionCritical: true},
+	"sb_sh_token":     {category: MapCategoryRuntime, admissionCritical: true},
 }
 
 func metadataForMapName(name string) mapMetadata {
-	if metadata, ok := configuredPolicyMapMetadata[name]; ok {
-		return metadata
+	metadata, ok := mapMetadataRegistry[name]
+	if !ok {
+		metadata = mapMetadata{category: MapCategoryRuntime}
 	}
-	return mapMetadata{category: MapCategoryRuntime}
+	if metadata.evictionMode == "" {
+		metadata.evictionMode = mapEvictionNone
+	}
+	return metadata
 }
 
 type MapOccupancyReport struct {
@@ -128,12 +172,15 @@ func InspectMapOccupancy() MapOccupancyReport {
 }
 
 func inspectMapOccupancy(m *CiliumEBPF.Map, id CiliumEBPF.MapID, info *CiliumEBPF.MapInfo) MapOccupancy {
-	item := MapOccupancy{ID: id, Name: info.Name, Category: metadataForMapName(info.Name).category, Type: info.Type.String(),
-		MaxEntries: info.MaxEntries, KeySize: info.KeySize, ValueSize: info.ValueSize, Flags: info.Flags}
+	metadata := metadataForMapName(info.Name)
+	item := MapOccupancy{ID: id, Name: info.Name, Category: metadata.category, Type: info.Type.String(),
+		MaxEntries: info.MaxEntries, KeySize: info.KeySize, ValueSize: info.ValueSize, Flags: info.Flags,
+		OccupancyMode: "not_applicable", EvictionMode: metadata.evictionMode, AdmissionCritical: metadata.admissionCritical}
 	if !occupancySupported(info.Type) {
 		item.Pressure = "not_applicable"
 		return item
 	}
+	item.OccupancyMode = "exact_scan"
 	item.Supported = true
 	var err error
 	item.Entries, err = countMapKeys(m, info.KeySize, info.MaxEntries)

@@ -62,21 +62,19 @@ func (b *CgroupBackend) loadCgroupObjectPrograms() ([]*CiliumEBPF.Program, error
 	}
 	normalSelections := selections
 	normalSlots := slots
-	loadSpec := loadCgroup
-	if b.runtime.coarse_time_supported {
-		loadSpec = loadCgroupCoarse
-	}
+	loadSpec := cgroupLoadSpec(b.runtime)
 	normalMaps := b.runtime.maps
 	loaded, err := loadObjectPrograms(loadSpec, normalMaps, normalSelections)
-	if err != nil && b.runtime.getpeername_supported {
+	if err != nil && (b.runtime.getpeername4_supported || b.runtime.getpeername6_supported) {
 		// The getpeername hooks are optional; a verifier that rejects them
 		// must not take interception down with them.
-		b.runtime.getpeername_supported = false
+		b.runtime.getpeername4_supported = false
+		b.runtime.getpeername6_supported = false
 		return b.loadCgroupObjectPrograms()
 	}
 	if err != nil && b.runtime.coarse_time_supported && coarseTimeUnavailable(err) {
 		b.runtime.coarse_time_supported = false
-		loadSpec = loadCgroup
+		loadSpec = cgroupLoadSpec(b.runtime)
 		loaded, err = loadObjectPrograms(loadSpec, normalMaps, normalSelections)
 	}
 	if err != nil {
@@ -84,6 +82,21 @@ func (b *CgroupBackend) loadCgroupObjectPrograms() ([]*CiliumEBPF.Program, error
 			b.runtime.udp_release_fallback_reason = "release_notification_program_load_failed"
 			if disableErr := b.disableUDPReleaseObserver(); disableErr != nil {
 				return nil, E.Errors(err, disableErr)
+			}
+			return b.loadCgroupObjectPrograms()
+		}
+		if b.runtime.direct_tgid {
+			b.runtime.direct_tgid = false
+			b.selfBypassTGID = 0
+			if b.selfBypass != nil {
+				if fallbackErr := b.selfBypass.fallbackDirectCgroup(); fallbackErr != nil {
+					return nil, E.Errors(err, E.Cause(fallbackErr, "activate cookie-based self-bypass fallback"))
+				}
+			}
+			if b.listenerPort != 0 {
+				if updateErr := b.updateCgroupControl(b.listenerPort); updateErr != nil {
+					return nil, E.Errors(err, updateErr)
+				}
 			}
 			return b.loadCgroupObjectPrograms()
 		}
@@ -98,6 +111,31 @@ func (b *CgroupBackend) loadCgroupObjectPrograms() ([]*CiliumEBPF.Program, error
 		return nil, err
 	}
 	return programs, nil
+}
+
+func cgroupLoadSpec(runtimeState *cgroupRuntime) func() (*CiliumEBPF.CollectionSpec, error) {
+	if runtimeState.direct_tgid {
+		if runtimeState.sk_storage {
+			if runtimeState.coarse_time_supported {
+				return loadCgroupTGIDStorageCoarse
+			}
+			return loadCgroupTGIDStorage
+		}
+		if runtimeState.coarse_time_supported {
+			return loadCgroupTGIDCoarse
+		}
+		return loadCgroupTGID
+	}
+	if runtimeState.sk_storage {
+		if runtimeState.coarse_time_supported {
+			return loadCgroupStorageCoarse
+		}
+		return loadCgroupStorage
+	}
+	if runtimeState.coarse_time_supported {
+		return loadCgroupCoarse
+	}
+	return loadCgroup
 }
 
 func (b *CgroupBackend) disableUDPReleaseObserver() error {
@@ -151,9 +189,9 @@ func (b *CgroupBackend) cgroupProgramEnabled(slot int) bool {
 	case cgroupProgramSocketRelease:
 		return b.runtime.enable_udp && b.runtime.socket_release_supported
 	case cgroupProgramGetpeername4:
-		return enableIPv4 && b.runtime.getpeername_supported
+		return enableIPv4 && b.runtime.getpeername4_supported
 	case cgroupProgramGetpeername6:
-		return (enableIPv4 || enableIPv6) && b.runtime.getpeername_supported
+		return (enableIPv4 || enableIPv6) && b.runtime.getpeername6_supported
 	default:
 		return false
 	}
@@ -232,6 +270,7 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16) error {
 		RedirectIPv4Prefix:   ipv4Prefix,
 		RedirectIPv4HostMask: ipv4HostMask,
 		ListenerPort:         listenerPort,
+		SelfBypassTGID:       b.selfBypassTGID,
 	}
 	if b.redirectIPv6.IsValid() {
 		address := b.redirectIPv6.Addr().As16()

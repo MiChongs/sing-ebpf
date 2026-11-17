@@ -10,12 +10,23 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestCgroupSocketPeerStorageMapABI(t *testing.T) {
+	key := cgroupSocketPeerStorageKeyType()
+	value := cgroupSocketPeerStorageValueType()
+	if key.TypeName() != "int" || value.TypeName() != "sb_ebpf_socket_peer_storage" {
+		t.Fatalf("unexpected sk_storage BTF types: key=%s value=%s", key.TypeName(), value.TypeName())
+	}
+}
+
 func TestCgroupNetworkGenerationABI(t *testing.T) {
-	if size := unsafe.Sizeof(cgroupControl{}); size != 32 {
+	if size := unsafe.Sizeof(cgroupControl{}); size != 36 {
 		t.Fatalf("unexpected cgroup control size: %d", size)
 	}
 	if offset := unsafe.Offsetof(cgroupControl{}.NetworkGeneration); offset != 4 {
 		t.Fatalf("unexpected cgroup network generation offset: %d", offset)
+	}
+	if offset := unsafe.Offsetof(cgroupControl{}.SelfBypassTGID); offset != 32 {
+		t.Fatalf("unexpected cgroup self-bypass TGID offset: %d", offset)
 	}
 	if size := unsafe.Sizeof(udpFlowValue{}); size != 32 {
 		t.Fatalf("unexpected cgroup UDP flow value size: %d", size)
@@ -28,6 +39,25 @@ func TestCgroupNetworkGenerationABI(t *testing.T) {
 	}
 	if offset := unsafe.Offsetof(udpTokenReverseValue{}.NetworkGeneration); offset != 8 {
 		t.Fatalf("unexpected UDP token reverse generation offset: %d", offset)
+	}
+}
+
+func TestNetworkGenerationWrapAndNormalization(t *testing.T) {
+	for _, testCase := range []struct {
+		input, want uint32
+	}{
+		{0, 1},
+		{1, 1},
+		{0x7ffffffe, 0x7ffffffe},
+		{0x7fffffff, 0x7fffffff},
+		{0xffffffff, 0x7fffffff},
+	} {
+		if got := normalizeNetworkGeneration(testCase.input); got != testCase.want {
+			t.Fatalf("normalizeNetworkGeneration(%#x)=%#x, want %#x", testCase.input, got, testCase.want)
+		}
+	}
+	if got := nextNetworkGeneration(0x7fffffff); got != 1 {
+		t.Fatalf("nextNetworkGeneration(max)=%d, want 1", got)
 	}
 }
 
@@ -78,7 +108,7 @@ func TestConfiguredPolicyMapPressureIsNeutral(t *testing.T) {
 }
 
 func TestMapMetadataClassifiesConfiguredPolicyMaps(t *testing.T) {
-	if got := metadataForMapName(cgroupBypassPortKernelMapName).category; got != MapCategoryConfiguredPolicy {
+	if got := metadataForMapName("sb_cg_byp_port").category; got != MapCategoryConfiguredPolicy {
 		t.Fatalf("cgroup bypass-port map category = %q, want %q", got, MapCategoryConfiguredPolicy)
 	}
 	if got := metadataForMapName("sb_tc_uid").category; got != MapCategoryConfiguredPolicy {
@@ -94,7 +124,7 @@ func TestKernelObjectNameLimit(t *testing.T) {
 		name string
 		ok   bool
 	}{
-		{name: "sb_cg_bypass_po", ok: true},
+		{name: "sb_cg_byp_port", ok: true},
 		{name: "123456789012345", ok: true},
 		{name: "1234567890123456", ok: false},
 	} {
@@ -128,6 +158,29 @@ func TestMapOccupancyStatusIgnoresNonApplicableMaps(t *testing.T) {
 	})
 	if status != "degraded" {
 		t.Fatalf("map occupancy status = %q, want degraded after recovery failure", status)
+	}
+}
+
+func TestMapMetadataDistinguishesAssignmentOwnership(t *testing.T) {
+	assignment := metadataForMapName("sb_tc_assign")
+	if assignment.category != MapCategoryRuntime || assignment.evictionMode != mapEvictionNone || !assignment.admissionCritical {
+		t.Fatalf("assignment metadata = %+v, want retained admission-critical runtime state", assignment)
+	}
+	cache := metadataForMapName("sb_tc_rfrag")
+	if cache.evictionMode != mapEvictionLRUSafeCache || cache.admissionCritical {
+		t.Fatalf("auxiliary metadata = %+v, want safe LRU cache", cache)
+	}
+	self := metadataForMapName("sb_self_sockets")
+	if self.evictionMode != mapEvictionNone || !self.admissionCritical {
+		t.Fatalf("self-bypass metadata = %+v, want non-evicting admission-critical state", self)
+	}
+	cgroupBypass := metadataForMapName("sb_cg_sock_byp")
+	if cgroupBypass.evictionMode != mapEvictionNone || !cgroupBypass.admissionCritical {
+		t.Fatalf("cgroup bypass metadata = %+v, want non-evicting admission-critical state", cgroupBypass)
+	}
+	policy := metadataForMapName("sb_tc_uid")
+	if policy.category != MapCategoryConfiguredPolicy || policy.evictionMode != mapEvictionNone {
+		t.Fatalf("policy metadata = %+v, want configured non-evicting policy", policy)
 	}
 }
 

@@ -19,6 +19,26 @@ The final-action policy boundary and consumer integration contract are in
 Build, generation, testing, debugging, and contribution procedures are in
 [DEVELOPING.md](DEVELOPING.md).
 
+## Release status
+
+The first beta is a compatibility release, not a stable ABI promise. The
+supported contract is the value-level policy, lifecycle, capability, and
+diagnostic surface documented here; generated objects and their Go/C ABI must
+be released together. `cgroup` and shared `packet_rewrite` are the
+compatibility-oriented paths. `socket_assign` is still experimental and needs
+namespace, veth, TC, and socket-assignment support from the target kernel.
+
+The release validation matrix covers a restricted 4.19.325 profile, cgroup
+and packet-rewrite paths on 5.4, and the full namespace/TC paths on 5.10 and
+6.6. These are pinned validation targets, not a promise that every vendor
+kernel with the same version works. A deployment is supported only after the
+selected data plane passes the non-attaching probe and a real startup/traffic
+and graceful-shutdown check on that device.
+
+Consumers should pin the exact module revision selected for the release. The
+Go ABI, generated objects, and source/object manifest are one release unit;
+do not copy an object or generated binding from another revision.
+
 ## Package boundary
 
 The dependency direction is enforced:
@@ -71,8 +91,11 @@ value-level flow and policy operations, and diagnostics. A non-nil
 and must be retained until `Close` succeeds.
 
 On-demand map occupancy diagnostics include library-owned `MapCategory` metadata.
-`runtime` maps describe live state and `configured_policy` maps describe
-capacity derived from the compiled policy; consumers should use this category
+`runtime` maps describe live state, while `configured_policy` maps describe
+capacity derived from the compiled policy. Runtime pressure is reported only
+for maps with a safe exact scan; fixed-layout maps are `not_applicable`, policy
+maps are `configured`, and an iteration error is `recovery_failed`. Consumers
+should use this metadata and the `eviction_mode`/`admission_critical` fields
 instead of maintaining a map-name classification list.
 
 ## Packet paths
@@ -97,9 +120,10 @@ IPv6 listener or change its policy. Optional cgroup self-bypass/process
 tracking is not a mandatory dependency of socket assignment. Missing
 capabilities fail startup explicitly; no mechanism silently changes.
 
-The library has three mechanisms and four selectable scope paths: local `socket_assign` or `cgroup`, and
-shared `socket_assign` or `packet_rewrite`. A consumer may enable either path
-independently. Exported capability probes can load and close selected generated
+The library has three mechanisms and four selectable scope paths: local
+`socket_assign` or `cgroup`, and shared `socket_assign` or `packet_rewrite`.
+A consumer may enable either path independently. Exported capability probes can
+load and close selected generated
 objects without attaching them, but attachment and network-state validation
 still require a real runtime startup.
 
@@ -200,6 +224,12 @@ socket-release cleanup when the optional multi-program probe succeeds;
 otherwise it uses bounded LRU recovery. The probe never performs an
 unflagged legacy attach, so it cannot replace an existing Android/netd
 socket-release owner merely to test the optional capability.
+On kernels that accept the optional cgroup `getpeername` hooks (normally Linux
+5.8 or newer), TCP also remembers the original destination by socket cookie and
+restores it when an intercepted socket asks for its peer address. This keeps
+applications that reuse `RemoteAddr` from sending a token address back into the
+redirect listener. If the hook is unavailable or rejected by vendor policy,
+interception remains enabled and the diagnostic reports the fallback.
 
 The kernel puts a cgroup hook in single-program mode when a program is attached
 without `BPF_F_ALLOW_MULTI`, and then rejects every multi-program attachment on
@@ -241,10 +271,36 @@ cgroup attachment, or the first socket registration. Data planes obtain it
 through `PreparedMap`, so a creation failure stops startup instead of leaving
 the data plane with a private map that never sees registered sockets.
 
-The interception cgroup is independent of an optional exclusive process cgroup
-used for self-bypass. A broad interception cgroup still excludes consumer-owned
-sockets through the shared cookie map. Userspace socket controls remain the
-fallback when process cgroup hooks cannot maintain that map.
+The interception cgroup is independent of an optional process cgroup used by
+the cookie bridge. A local cgroup data plane first loads a direct-TGID object:
+its connect/sendmsg programs compare the current TGID and bypass the consumer
+without publishing per-socket state. The generated legacy object does not
+reference that helper; a missing helper or rejected direct object therefore
+falls back to the existing cookie producer chain without raising the minimum
+kernel requirement. Local TC first tries socket-local storage: cgroup
+socket-create or connect/sendmsg hooks publish the self-bypass bit, and the TC
+classifier reads it through the packet's full socket. The same hooks retain a
+cookie-hash shadow for sockets whose storage allocation fails and for sockets
+created while the runtime changes paths. If the representative TC storage
+object is rejected, the ordinary cookie-only object is loaded instead.
+Userspace can publish storage through a live socket FD when the process cgroup
+is not exclusive; a failed per-socket storage update falls back to the cookie
+hash. These choices do not raise the minimum kernel requirement.
+
+Self-bypass diagnostics model decision, producer, visibility, cleanup, reclaim,
+and attachment independently. A direct local-cgroup path reports
+`direct_tgid`, `none`, `direct_tgid`, `none`, `none`, and `none`. Cookie paths
+report `cgroup_tgid` or `userspace_control` as the decision,
+`cgroup_sock_create`, `cgroup_addr`, or `userspace_control` as the producer,
+`sk_storage` or `cookie_hash` as visibility, and `sk_storage`, `socket_release`,
+or `userspace_unregister` as cleanup. Storage is reported only after the actual
+TC object has loaded; map creation or a preliminary helper probe is not enough.
+The storage-write-failure and cookie-fallback counters cover userspace
+publication. `proc_fd_reclaim` is reported only as bounded cookie map-full
+recovery, with attempt, reclaimed-entry, failure, and last-run counters.
+Attachment diagnostics separately report `bpf_link`, `legacy_attach`, or
+`mixed`. The registration token ties fallback-cookie cleanup to the socket that
+was actually published.
 
 ## Socket assignment
 
@@ -256,10 +312,13 @@ and performs direct `bpf_skc_lookup_tcp` lookup. UDP lookup substitutes only the
 internal listener port. `tc_assignment` records the original tuple, ingress
 interface, shared source MAC, packet path, and (for local process matching) the
 socket cookie used to recover the process owner. The separate
-`tc_self_sockets` map (shared as `sb_self_sockets`) contains consumer self-bypass
-flags and, when UID policy tracking is enabled, application socket policy flags.
-Local egress checks the self-bypass bit before interception and uses the policy
-bits when evaluating UID decisions. CIDR bypass rules do not populate this map.
+`tc_self_sockets` map (shared as `sb_self_sockets`) contains the cookie fallback
+for consumer self-bypass flags and, when UID policy tracking is enabled,
+application socket policy flags. When the optional storage object loads, local
+egress checks `sb_self_store` first and falls back to the cookie map; shared
+ingress never reads socket storage. The policy bits remain in the cookie map
+when evaluating UID decisions. CIDR bypass rules do not populate either
+self-bypass backend.
 The optional cgroup socket-address tracker records cookie, PID, and UID in a
 bounded LRU map. Userspace then reads only `/proc/<pid>/exe` instead of scanning
 all process file descriptors. The tracker always attaches to the cgroup v2
@@ -315,7 +374,8 @@ before source selectors by default, or after selectors when
 Port 53 has no special meaning in native code. Consumers such as sing-box
 compile DNS modes into these generic port actions.
 
-Local egress checks the socket-cookie self-bypass map. Shared source CIDR and
+Local egress checks socket-local self-bypass metadata when selected, then the
+socket-cookie fallback map. Shared source CIDR and
 MAC include/exclude policies are evaluated only on the shared path. If either
 include list is configured, CIDR and MAC are alternative selectors (OR); a
 matching CIDR or MAC exclude always wins. Local and shared destination-bypass
@@ -386,7 +446,7 @@ same interface.
 | Group | Map types | Purpose |
 | --- | --- | --- |
 | control | `ARRAY` | Enable state, path flags, listener port, and delivery interface identity. |
-| sockets and assignments | `SOCKMAP` (optional), `LRU_HASH` | Preferred TCP listener fallback, original-flow metadata, and local self-bypass cookies. Legacy TCP lookup does not use SOCKMAP. |
+| sockets and assignments | `SOCKMAP` (optional), `LRU_HASH`, `SK_STORAGE` (optional) | Preferred TCP listener fallback, original-flow metadata, local self-bypass cookies, and socket-local self-bypass lifetime state. Legacy TCP lookup does not use SOCKMAP; `SK_STORAGE` is capability-selected and has no fixed occupancy limit. |
 | local cgroup UDP state | `HASH`/`LRU_HASH`, `LRU_HASH` | Redirect/token maps use preallocated `HASH` with socket-release cleanup, or bounded `LRU_HASH` without it; peer state follows the same capability and flow state is always bounded. |
 | prefix policy | `LPM_TRIE` | UID ranges, source CIDRs, and destination bypass CIDRs. |
 | exact policy | `HASH` | Host addresses and shared source MAC policy. |
@@ -395,11 +455,13 @@ same interface.
 ### LPM trie kernel safety
 
 The LPM maps are created for a uniform object layout, but they are updated only
-when the corresponding policy has entries. Linux 6.6.0 through 6.6.46 has an
-upstream LPM key-layout defect that can trigger an out-of-bounds report, or a
-kernel fault on affected UBSAN/fortify builds, during an update. The upstream
-fix (`bpf_lpm_trie_key_u8`) is present in 6.6.47 and may be backported by a
-vendor.
+when the corresponding policy has entries. Consumers may omit a redundant
+force-intercept prefix when their effective default action already intercepts
+the same traffic; the library does not infer that optimization or interpret
+FakeIP. Linux 6.6.0 through 6.6.46 has an upstream LPM key-layout defect that
+can trigger an out-of-bounds report, or a kernel fault on affected
+UBSAN/fortify builds, during an update. The upstream fix
+(`bpf_lpm_trie_key_u8`) is present in 6.6.47 and may be backported by a vendor.
 
 Because a generic map-type probe cannot safely detect this defect, policy setup
 uses a conservative release check for that range and accepts it only when the
@@ -548,7 +610,9 @@ The Go packages require Linux or Android and the `with_ebpf` build tag. Normal
 builds use the checked-in generated objects and do not require cgo, bpftool,
 kernel BTF, or an Android NDK.
 
-Generated objects use Android NDK r29 Clang 21:
+Generated objects use Android NDK r29 Clang 21. Consumers use the checked-in
+objects and do not need the NDK or a C toolchain; maintainers should use the
+Go toolchain required by the consuming sing-box/upstream branch:
 
 ```bash
 make generate

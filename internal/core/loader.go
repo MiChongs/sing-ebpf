@@ -12,6 +12,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
@@ -83,9 +84,23 @@ func newCgroupHookOccupiedError(attachType CiliumEBPF.AttachType, programs []lin
 
 var loadTC = BPFGen.LoadTC
 
+var loadTCStorage = BPFGen.LoadTCStorage
+
 var loadCgroup = BPFGen.LoadCgroup
 
+var loadCgroupStorage = BPFGen.LoadCgroupStorage
+
+var loadCgroupStorageCoarse = BPFGen.LoadCgroupStorageCoarse
+
 var loadCgroupCoarse = BPFGen.LoadCgroupCoarse
+
+var loadCgroupTGID = BPFGen.LoadCgroupTGID
+
+var loadCgroupTGIDStorage = BPFGen.LoadCgroupTGIDStorage
+
+var loadCgroupTGIDStorageCoarse = BPFGen.LoadCgroupTGIDStorageCoarse
+
+var loadCgroupTGIDCoarse = BPFGen.LoadCgroupTGIDCoarse
 
 var loadSharedNetwork = BPFGen.LoadSharedNetwork
 
@@ -234,6 +249,10 @@ type mapSpecOverride struct {
 	mapType    CiliumEBPF.MapType
 	maxEntries uint32
 	flags      uint32
+	keySize    uint32
+	valueSize  uint32
+	keyType    btf.Type
+	valueType  btf.Type
 }
 
 func validateKernelObjectName(name string) error {
@@ -264,13 +283,25 @@ func loadObjectMaps(
 		if err = validateKernelObjectName(override.name); err != nil {
 			return nil, E.Cause(err, "invalid eBPF map override for ", name)
 		}
-		if override.mapType == CiliumEBPF.UnspecifiedMap || override.maxEntries == 0 {
+		if override.mapType == CiliumEBPF.UnspecifiedMap || (override.maxEntries == 0 && override.mapType != CiliumEBPF.SkStorage) {
 			return nil, E.New("invalid eBPF map override for ", name)
 		}
 		mapSpec.Name = override.name
 		mapSpec.Type = override.mapType
 		mapSpec.MaxEntries = override.maxEntries
 		mapSpec.Flags = override.flags
+		if override.keySize != 0 {
+			mapSpec.KeySize = override.keySize
+		}
+		if override.valueSize != 0 {
+			mapSpec.ValueSize = override.valueSize
+		}
+		if override.keyType != nil {
+			mapSpec.Key = override.keyType
+		}
+		if override.valueType != nil {
+			mapSpec.Value = override.valueType
+		}
 		mapSpec.Extra = nil
 	}
 	for name := range overrides {

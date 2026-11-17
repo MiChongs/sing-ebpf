@@ -9,6 +9,7 @@
 #include <linux/bpf.h>
 
 #define BPF_ANY 0U
+#define BPF_NOEXIST 1U
 #define BPF_F_CURRENT_NETNS (-1ULL)
 #define BPF_F_INGRESS (1ULL << 0)
 #define BPF_TCP_LISTEN 10U
@@ -64,6 +65,9 @@
 #define SB_TC_SOCKET_POLICY_BYPASS 1U
 #define SB_TC_SOCKET_POLICY_INTERCEPT 2U
 
+#define SB_TC_ASSIGNMENT_CLAIM_PUBLISH 1U
+#define SB_TC_ASSIGNMENT_CLAIM_RETIRE 2U
+
 
 #define SB_TC_LISTENER_TCP4 0U
 #define SB_TC_LISTENER_TCP6 1U
@@ -89,7 +93,8 @@ struct sb_tc_control {
     __u32 delivery_ifindex;
     __u32 routing_mark;
     __u16 listener_port;
-    __u16 reserved_policy[2];
+    __u16 reserved_policy;
+    __u32 network_generation;
     __u8 delivery_mac[6];
     __u16 reserved;
 };
@@ -147,7 +152,16 @@ struct sb_tc_assign_value {
     __u8 path;
     __u8 source_mac_valid;
     __u32 generation;
+    __u32 network_generation;
+    __u8 reserved[4];
 };
+
+struct sb_tc_assignment_claim {
+    __u64 socket_cookie;
+    __u32 generation;
+    __u32 state;
+};
+
 
 _Static_assert(sizeof(struct sb_tc_control) == 32, "sb_tc_control ABI size");
 _Static_assert(__builtin_offsetof(struct sb_tc_control, delivery_ifindex) == 8,
@@ -156,14 +170,21 @@ _Static_assert(__builtin_offsetof(struct sb_tc_control, routing_mark) == 12,
     "sb_tc_control routing_mark ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_control, listener_port) == 16,
     "sb_tc_control listener_port ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_control, network_generation) == 20,
+    "sb_tc_control network generation ABI offset");
 _Static_assert(sizeof(struct sb_tc_assign_key) == 44, "sb_tc_assign_key ABI size");
-_Static_assert(sizeof(struct sb_tc_assign_value) == 32, "sb_tc_assign_value ABI size");
+_Static_assert(sizeof(struct sb_tc_assign_value) == 40, "sb_tc_assign_value ABI size");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_cookie) == 0,
     "sb_tc_assign_value socket_cookie ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, last_seen_ns) == 8,
     "sb_tc_assign_value last_seen_ns ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, generation) == 28,
     "sb_tc_assign_value generation ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, network_generation) == 32,
+    "sb_tc_assign_value network generation ABI offset");
+_Static_assert(sizeof(struct sb_tc_assignment_claim) == 16, "sb_tc_assignment_claim ABI size");
+_Static_assert(__builtin_offsetof(struct sb_tc_assignment_claim, state) == 12,
+    "sb_tc_assignment_claim state ABI offset");
 
 struct ethernet_header {
     __u8 destination[6];
@@ -227,11 +248,30 @@ struct ipv6_fragment_header {
         .max_entries = entries, \
     }
 
+#define MAP_FLAGS(name, key, value, map_type, entries, flags) \
+    struct bpf_map_def SEC("maps") name = { \
+        .type = map_type, .key_size = sizeof(key), .value_size = sizeof(value), \
+        .max_entries = entries, .map_flags = flags, \
+    }
+
 MAP(tc_control, __u32, struct sb_tc_control, BPF_MAP_TYPE_ARRAY, 1U);
 MAP(tc_listener_sockets, __u32, __u32, BPF_MAP_TYPE_SOCKMAP, SB_TC_LISTENER_COUNT);
-MAP(tc_assignment, struct sb_tc_assign_key, struct sb_tc_assign_value, BPF_MAP_TYPE_LRU_HASH, 65536U);
+/* Assignment ownership is explicit: userspace reclaims entries by generation
+ * and activity timestamp. Do not let the kernel silently evict a live flow. */
+MAP_FLAGS(tc_assignment, struct sb_tc_assign_key, struct sb_tc_assign_value, BPF_MAP_TYPE_HASH, 32768U, BPF_F_NO_PREALLOC);
+/* Short-lived publication claims serialize tuple reuse without adding a
+ * spin-lock to every active assignment value. Claims are deleted immediately
+ * after publication and are never part of the data-plane lookup path. */
+MAP_FLAGS(tc_assignment_claim, struct sb_tc_assign_key, struct sb_tc_assignment_claim, BPF_MAP_TYPE_HASH, 32768U, BPF_F_NO_PREALLOC);
 MAP(tc_stats, __u32, __u64, BPF_MAP_TYPE_PERCPU_ARRAY, SB_TC_STAT_COUNT);
-MAP(tc_self_sockets, __u64, __u32, BPF_MAP_TYPE_LRU_HASH, 65536U);
+/* Self-bypass is core ownership state. Userspace or sock_release removes
+ * entries; silent LRU eviction can recapture an active proxy socket. */
+MAP_FLAGS(tc_self_sockets, __u64, __u32, BPF_MAP_TYPE_HASH, 65536U, BPF_F_NO_PREALLOC);
+#ifdef SB_TC_SELF_BYPASS_STORAGE
+/* Optional socket-local visibility for local egress. The cookie hash remains
+ * present as a transition and per-socket compatibility fallback. */
+MAP_FLAGS(tc_self_storage, int, __u32, BPF_MAP_TYPE_SK_STORAGE, 0U, BPF_F_NO_PREALLOC);
+#endif
 MAP(tc_uid_policy, struct sb_tc_uid_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 4096U);
 MAP(tc_local_bypass_ipv4, struct sb_tc_ipv4_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
 MAP(tc_local_bypass_ipv6, struct sb_tc_ipv6_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
@@ -263,6 +303,11 @@ static __u32 next_assignment_generation(const struct sb_tc_assign_value *existin
 }
 static __u32 (*get_socket_uid)(void *ctx) = (void *)BPF_FUNC_get_socket_uid;
 static __u64 (*get_socket_cookie)(void *ctx) = (void *)BPF_FUNC_get_socket_cookie;
+#ifdef SB_TC_SELF_BYPASS_STORAGE
+static struct bpf_sock *(*sk_fullsock)(struct bpf_sock *socket) = (void *)BPF_FUNC_sk_fullsock;
+static void *(*sk_storage_get)(void *map, void *socket, void *value, __u64 flags) =
+    (void *)BPF_FUNC_sk_storage_get;
+#endif
 static long (*redirect)(int ifindex, __u64 flags) = (void *)BPF_FUNC_redirect;
 static long (*skb_store_bytes)(void *ctx, __u32 offset, const void *from, __u32 length, __u64 flags) =
     (void *)BPF_FUNC_skb_store_bytes;
@@ -333,6 +378,19 @@ INLINE bool uid_bypassed(struct __sk_buff *skb, const struct sb_tc_control *cont
     __builtin_memcpy(key.uid, &uid, sizeof(uid));
     bool matched = map_lookup(&tc_uid_policy, &key) != 0;
     return (control->flags & SB_TC_FLAG_UID_DEFAULT_BYPASS) != 0U ? !matched : matched;
+}
+
+INLINE __u32 socket_storage_metadata(struct __sk_buff *skb) {
+#ifdef SB_TC_SELF_BYPASS_STORAGE
+    if (skb->sk != 0) {
+        struct bpf_sock *socket = sk_fullsock(skb->sk);
+        if (socket != 0) {
+            __u32 *storage = sk_storage_get(&tc_self_storage, socket, 0, 0U);
+            if (storage != 0) return *storage;
+        }
+    }
+#endif
+    return 0U;
 }
 
 INLINE __u32 socket_metadata(__u64 socket_cookie) {
@@ -772,6 +830,7 @@ INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_pr
     // self-bypass check.
     int parsed = parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, ethernet, false, &key, source_mac, &flags);
     if (parsed == SB_TC_PARSE_PASS) return TC_ACT_UNSPEC;
+    if ((socket_storage_metadata(skb) & SB_EBPF_SOCKET_METADATA_SELF_BYPASS) != 0U) return TC_ACT_UNSPEC;
     __u64 socket_cookie = get_socket_cookie(skb);
     __u32 socket_metadata_value = socket_metadata(socket_cookie);
     if ((socket_metadata_value & SB_EBPF_SOCKET_METADATA_SELF_BYPASS) != 0U) return TC_ACT_UNSPEC;

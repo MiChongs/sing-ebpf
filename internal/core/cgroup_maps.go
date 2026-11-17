@@ -9,14 +9,47 @@ import (
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
 )
 
-const cgroupBypassPortKernelMapName = "sb_cg_bypass_po"
+// The sk_storage map is declared as a minimal bpf_map_def in the generated
+// object because the program only needs the kernel socket as its key. Android
+// GKI kernels nevertheless validate the full local-storage ABI at map-create
+// time: a four-byte integer key, BPF_F_NO_PREALLOC, and non-zero BTF IDs for
+// both key and value. Keep those types here, next to the override that uses
+// them, so the object and loader share one documented ABI.
+func cgroupSocketPeerStorageKeyType() btf.Type {
+	return &btf.Int{Name: "int", Size: 4, Encoding: btf.Signed}
+}
+
+func cgroupSocketPeerStorageValueType() btf.Type {
+	u8 := &btf.Int{Name: "__u8", Size: 1, Encoding: btf.Unsigned}
+	u16 := &btf.Int{Name: "__u16", Size: 2, Encoding: btf.Unsigned}
+	u32 := &btf.Int{Name: "__u32", Size: 4, Encoding: btf.Unsigned}
+	peer := &btf.Struct{
+		Name: "sb_ebpf_udp_peer_value",
+		Size: 20,
+		Members: []btf.Member{
+			{Name: "family", Type: u8, Offset: 0},
+			{Name: "protocol", Type: u8, Offset: 8},
+			{Name: "port", Type: u16, Offset: 16},
+			{Name: "addr", Type: &btf.Array{Index: u32, Type: u8, Nelems: 16}, Offset: 32},
+		},
+	}
+	return &btf.Struct{
+		Name:    "sb_ebpf_socket_peer_storage",
+		Size:    20,
+		Members: []btf.Member{{Name: "peer", Type: peer, Offset: 0}},
+	}
+}
 
 func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, uidEntries int, localPortEntries int, selfBypassMap *CiliumEBPF.Map, force dualStackCIDRPrefixes) error {
+	// A failed sk_storage attempt is retried with the cookie-map object; only
+	// the attempt that loads may report why release notification is off.
+	runtimeState.udp_release_fallback_reason = ""
 	udpLayout := cgroupUDPMapConfiguration(
 		runtimeState.enable_udp,
 		runtimeState.socket_release_supported,
@@ -38,15 +71,13 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 	overrides := map[string]mapSpecOverride{
 		"cgroup_control":           {name: "sb_cg_control", mapType: CiliumEBPF.Array, maxEntries: 1},
 		"cgroup_tcp_redirect":      {name: "sb_cg_tcp", mapType: CiliumEBPF.LRUHash, maxEntries: tcpCapacity},
-		"cgroup_tcp_peer":          {name: "sb_cg_tcp_peer", mapType: CiliumEBPF.LRUHash, maxEntries: tcpCapacity},
 		"cgroup_udp_redirect":      {name: "sb_cg_udp", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
 		"cgroup_udp_recovery":      {name: "sb_cg_recover", mapType: CiliumEBPF.LRUHash, maxEntries: recoveryCapacity},
 		"cgroup_udp_token":         {name: "sb_cg_token", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
 		"cgroup_udp_token_reverse": {name: "sb_cg_token_rev", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
-		"cgroup_udp_peer":          {name: "sb_cg_peer", mapType: udpLayout.peerType, maxEntries: udpLayout.peerCapacity, flags: udpLayout.peerFlags},
 		"cgroup_udp_flow":          {name: "sb_cg_flow", mapType: CiliumEBPF.LRUHash, maxEntries: udpLayout.flowCapacity},
 		"cgroup_socket_bypass":     {name: "sb_cg_sock_byp", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.SocketBypass},
-		"cgroup_bypass_port":       {name: cgroupBypassPortKernelMapName, mapType: CiliumEBPF.Hash, maxEntries: max(uint32(localPortEntries), 1), flags: bpfFlagNoPrealloc},
+		"cgroup_bypass_port":       {name: "sb_cg_byp_port", mapType: CiliumEBPF.Hash, maxEntries: max(uint32(localPortEntries), 1), flags: bpfFlagNoPrealloc},
 		"cgroup_uid_policy":        {name: "sb_cg_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: uidCapacity, flags: bpfFlagNoPrealloc},
 		"cgroup_bypass_ipv4":       {name: "sb_cg_bypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxDestinationCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
 		"cgroup_bypass_ipv6":       {name: "sb_cg_bypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxDestinationCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
@@ -55,12 +86,30 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 		"cgroup_udp_release_watch": {
 			name: "sb_cg_rel_watch", mapType: CiliumEBPF.Hash, maxEntries: 1, flags: bpfFlagNoPrealloc,
 		},
+		"cgroup_udp_release_stats": {
+			name: "sb_cg_rel_stat", mapType: CiliumEBPF.PerCPUArray, maxEntries: cgroupUDPReleaseStatsCount,
+		},
+	}
+	loadSpec := loadCgroup
+	if runtimeState.sk_storage {
+		overrides["cgroup_socket_peer_storage"] = mapSpecOverride{
+			name: "sb_cg_sk_peer", mapType: CiliumEBPF.SkStorage,
+			flags: bpfFlagNoPrealloc, keySize: 4, valueSize: 20,
+			keyType: cgroupSocketPeerStorageKeyType(), valueType: cgroupSocketPeerStorageValueType(),
+		}
+		loadSpec = loadCgroupStorage
+		if runtimeState.coarse_time_supported {
+			loadSpec = loadCgroupStorageCoarse
+		}
+	} else {
+		overrides["cgroup_tcp_peer"] = mapSpecOverride{name: "sb_cg_tcp_peer", mapType: CiliumEBPF.LRUHash, maxEntries: tcpCapacity}
+		overrides["cgroup_udp_peer"] = mapSpecOverride{name: "sb_cg_peer", mapType: udpLayout.peerType, maxEntries: udpLayout.peerCapacity, flags: udpLayout.peerFlags}
 	}
 	addForceMapOverrides(overrides, "cgroup", "sb_cg_force", force)
 	if selfBypassMap != nil {
 		// The temporary object map is replaced by the shared owner below.
 		overrides["cgroup_socket_bypass"] = mapSpecOverride{
-			name: "sb_cg_sock_byp", mapType: CiliumEBPF.LRUHash, maxEntries: 1,
+			name: "sb_cg_sock_byp", mapType: CiliumEBPF.Hash, maxEntries: 1, flags: bpfFlagNoPrealloc,
 		}
 	}
 	ringbufSupported := features.HaveMapType(CiliumEBPF.RingBuf) == nil
@@ -74,20 +123,16 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 		overrides["cgroup_udp_release_events"] = mapSpecOverride{
 			name: "sb_cg_rel_evt", mapType: CiliumEBPF.RingBuf, maxEntries: cgroupUDPReleaseRingSize,
 		}
-		overrides["cgroup_udp_release_stats"] = mapSpecOverride{
-			name: "sb_cg_rel_stat", mapType: CiliumEBPF.PerCPUArray, maxEntries: 1,
-		}
 	}
 	var err error
-	runtimeState.maps, err = loadObjectMaps(loadCgroup, overrides)
+	runtimeState.maps, err = loadObjectMaps(loadSpec, overrides)
 	if err != nil && overrides["cgroup_udp_release_events"].mapType == CiliumEBPF.RingBuf {
 		runtimeState.udp_release_fallback_reason = "ringbuf_map_load_failed"
 		delete(overrides, "cgroup_udp_release_events")
-		delete(overrides, "cgroup_udp_release_stats")
 		overrides["cgroup_udp_release_watch"] = mapSpecOverride{
 			name: "sb_cg_rel_watch", mapType: CiliumEBPF.Hash, maxEntries: 1, flags: bpfFlagNoPrealloc,
 		}
-		runtimeState.maps, err = loadObjectMaps(loadCgroup, overrides)
+		runtimeState.maps, err = loadObjectMaps(loadSpec, overrides)
 	}
 	if err != nil {
 		return err
@@ -124,7 +169,11 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 	runtimeState.udp_recovery_map_fd = runtimeState.maps["cgroup_udp_recovery"].FD()
 	runtimeState.udp_token_map_fd = runtimeState.maps["cgroup_udp_token"].FD()
 	runtimeState.udp_token_reverse_map_fd = runtimeState.maps["cgroup_udp_token_reverse"].FD()
-	runtimeState.udp_peer_map_fd = runtimeState.maps["cgroup_udp_peer"].FD()
+	if peerMap := runtimeState.maps["cgroup_udp_peer"]; peerMap != nil {
+		runtimeState.udp_peer_map_fd = peerMap.FD()
+	} else {
+		runtimeState.udp_peer_map_fd = -1
+	}
 	runtimeState.udp_flow_map_fd = runtimeState.maps["cgroup_udp_flow"].FD()
 	runtimeState.bypass_socket_cookie_map_fd = runtimeState.maps["cgroup_socket_bypass"].FD()
 	runtimeState.uid_policy_map_fd = runtimeState.maps["cgroup_uid_policy"].FD()

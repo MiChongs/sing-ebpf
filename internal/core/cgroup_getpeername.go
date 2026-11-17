@@ -14,10 +14,10 @@ import (
 // getpeername programs (Linux 5.8+). The hooks only restore the original
 // destination a redirected socket reports as its peer, so a kernel or policy
 // that rejects them leaves interception itself unaffected.
-func probeGetpeernameSupport() bool {
+func probeGetpeernameSupport(attachType CiliumEBPF.AttachType) bool {
 	program, err := CiliumEBPF.NewProgram(&CiliumEBPF.ProgramSpec{
 		Type:       CiliumEBPF.CGroupSockAddr,
-		AttachType: CiliumEBPF.AttachCgroupInet4GetPeername,
+		AttachType: attachType,
 		License:    "GPL",
 		Instructions: asm.Instructions{
 			asm.Mov.Imm(asm.R0, 1),

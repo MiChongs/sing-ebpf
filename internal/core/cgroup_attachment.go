@@ -30,6 +30,13 @@ type retryableCgroupProgramLink interface {
 	IsClosed() bool
 }
 
+func cgroupProgramLinkMechanism(programLink cgroupProgramLink) string {
+	if _, legacy := programLink.(*legacyCgroupProgramLink); legacy {
+		return "legacy_attach"
+	}
+	return "bpf_link"
+}
+
 // cgroupProgramLinkCloseComplete distinguishes a failed legacy detach, whose
 // target FD must be retained for another attempt, from link.Close errors where
 // the link FD has already been consumed and cannot be retried safely.
@@ -405,7 +412,7 @@ func detachOwnedCgroupPrograms(cgroupFD int, slot int) error {
 				continue
 			}
 			if (definition.attachType == CiliumEBPF.AttachCgroupInet4GetPeername ||
-				definition.attachType == CiliumEBPF.AttachCgroupInet6GetPeername) && socketReleaseUnavailable(err) {
+				definition.attachType == CiliumEBPF.AttachCgroupInet6GetPeername) && getpeernameUnavailable(err) {
 				continue
 			}
 			return err

@@ -30,11 +30,20 @@ func TestTCABI(t *testing.T) {
 	if offset := unsafe.Offsetof(tcControl{}.ListenerPort); offset != 16 {
 		t.Fatalf("unexpected TC listener port offset: %d", offset)
 	}
+	if offset := unsafe.Offsetof(tcControl{}.NetworkGeneration); offset != 20 {
+		t.Fatalf("unexpected TC network generation offset: %d", offset)
+	}
 	if size := unsafe.Sizeof(tcAssignKey{}); size != 44 {
 		t.Fatalf("unexpected TC assignment key size: %d", size)
 	}
-	if size := unsafe.Sizeof(TCAssignment{}); size != 32 {
+	if size := unsafe.Sizeof(TCAssignment{}); size != 40 {
 		t.Fatalf("unexpected TC assignment value size: %d", size)
+	}
+	if size := unsafe.Sizeof(tcAssignmentClaim{}); size != 16 {
+		t.Fatalf("unexpected TC assignment claim size: %d", size)
+	}
+	if offset := unsafe.Offsetof(tcAssignmentClaim{}.State); offset != 12 {
+		t.Fatalf("unexpected TC assignment claim state offset: %d", offset)
 	}
 	if offset := unsafe.Offsetof(TCAssignment{}.SocketCookie); offset != 0 {
 		t.Fatalf("unexpected TC assignment socket cookie offset: %d", offset)
@@ -44,6 +53,23 @@ func TestTCABI(t *testing.T) {
 	}
 	if offset := unsafe.Offsetof(TCAssignment{}.InterfaceIndex); offset != 16 {
 		t.Fatalf("unexpected TC assignment interface index offset: %d", offset)
+	}
+	if offset := unsafe.Offsetof(TCAssignment{}.NetworkGeneration); offset != 32 {
+		t.Fatalf("unexpected TC assignment network generation offset: %d", offset)
+	}
+	if offset := unsafe.Offsetof(TCAssignment{}.Reserved); offset != 36 {
+		t.Fatalf("unexpected TC assignment reserved offset: %d", offset)
+	}
+}
+
+func TestTCReturnRetirementUsesReservedGenerationBit(t *testing.T) {
+	if tcReturnRetiring != ^networkGenerationMask {
+		t.Fatalf("retirement bit = %#x, want %#x", tcReturnRetiring, ^networkGenerationMask)
+	}
+	for _, generation := range []uint32{1, 2, 0x7fffffff} {
+		if generation&tcReturnRetiring != 0 {
+			t.Fatalf("valid generation %#x is classified as retiring", generation)
+		}
 	}
 }
 
